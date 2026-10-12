@@ -187,6 +187,75 @@ func TestVoidRefundsCostBasis(t *testing.T) {
 	}
 }
 
+// A void after a TRANSFER refunds cost basis, not qty * entry price: alice's
+// basis drops by the 280 she received from carol, and carol's basis is the
+// 280 she paid, so the refunds sum to escrow and every wallet nets to zero.
+func TestVoidAfterTransferRefundsCostBasis(t *testing.T) {
+	r := newFakeRepo()
+	apply(t, r, mintEvents()...)
+	apply(t, r,
+		at(4, 0, accepted(order("o_s", "u_alice", "c2", 0, sell, 70, 4), 4)),
+		at(5, 0, accepted(order("o_c", "u_carol", "c1", 0, buy, 70, 4), 0)),
+		at(5, 1, fill("f2", commonv1.FillKind_FILL_KIND_TRANSFER, 4,
+			leg("o_c", "u_carol", 0, buy, 70, true), leg("o_s", "u_alice", 0, sell, 70, false))),
+	)
+	pa, pc := r.positions[PositionKey{"u_alice", mkt, 0}], r.positions[PositionKey{"u_carol", mkt, 0}]
+	if pa.Qty != 6 || pa.Cost != 600-280 || pc.Qty != 4 || pc.Cost != 280 {
+		t.Fatalf("basis after transfer alice=%+v carol=%+v", pa, pc)
+	}
+	apply(t, r, at(6, 0, &enginev1.Event{Body: &enginev1.Event_MarketVoided{
+		MarketVoided: &enginev1.MarketVoided{Reason: "feeds stale"},
+	}}))
+
+	var void *fakeTxn
+	for i := range r.txns {
+		var sum int64
+		for _, e := range r.txns[i].Entries {
+			sum += e.AmountCents
+		}
+		if sum != 0 {
+			t.Fatalf("txn %s %v unbalanced by %d", r.txns[i].Kind, r.txns[i].Key, sum)
+		}
+		if r.txns[i].Kind == "void" {
+			void = &r.txns[i]
+		}
+	}
+	if void == nil {
+		t.Fatal("no void txn")
+	}
+	refunds := map[string]int64{}
+	for _, e := range void.Entries {
+		refunds[e.AccountID] += e.AmountCents
+	}
+	want := map[string]int64{
+		CashAccount("u_alice"): 320, CashAccount("u_bob"): 400, CashAccount("u_carol"): 280, EscrowAccount(mkt): -1000,
+	}
+	if len(refunds) != len(want) {
+		t.Fatalf("void entries = %v, want %v", refunds, want)
+	}
+	for acct, amt := range want {
+		if refunds[acct] != amt {
+			t.Fatalf("void entries = %v, want %v", refunds, want)
+		}
+	}
+	if got := r.balance(EscrowAccount(mkt)); got != 0 {
+		t.Fatalf("escrow = %d, want 0", got)
+	}
+	var total int64
+	for u, w := range r.wallets {
+		if w != 0 {
+			t.Fatalf("wallet %s = %d, want 0 (wallets %v)", u, w, r.wallets)
+		}
+		total += w
+	}
+	if total != 0 { // every wallet started at 0
+		t.Fatalf("wallets sum to %d, want the starting total 0", total)
+	}
+	if r.markets[mkt].Status != "voided" || !pa.Settled || !pc.Settled {
+		t.Fatalf("market %s, alice settled=%v carol settled=%v", r.markets[mkt].Status, pa.Settled, pc.Settled)
+	}
+}
+
 func TestMintWithoutMarketCreated(t *testing.T) {
 	r := newFakeRepo()
 	apply(t, r, mintEvents()[1:]...)

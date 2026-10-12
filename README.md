@@ -41,6 +41,11 @@ make infra-down
 
 Redpanda console: http://localhost:8085
 
+Dev auth: in milestone 1 the gateway trusts the `X-User-Id` request header as
+the caller identity, so any client can act as any user. The gateway logs a
+warning about this at startup. JWT auth replaces it in milestone 4; do not
+expose the M1 gateway publicly.
+
 ## Status
 
 Milestone 1 (vertical slice) in progress.
