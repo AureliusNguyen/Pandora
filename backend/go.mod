@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	connectrpc.com/otelconnect v0.7.1
 	github.com/caarlos0/env/v11 v11.3.1
 	github.com/jackc/pgx/v5 v5.7.2
 	github.com/pressly/goose/v3 v3.24.1
