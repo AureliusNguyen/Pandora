@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -59,6 +60,9 @@ type Matcher struct {
 	HTTPAddr         string `env:"HTTP_ADDR" envDefault:":9001"`
 	EnginePartitions uint32 `env:"ENGINE_PARTITIONS" envDefault:"1"`
 	DemoMarket       bool   `env:"DEMO_MARKET" envDefault:"true"`
+	// ShutdownGrace bounds how long unpublished events keep being retried
+	// after SIGTERM (a Go duration; cmd/matcher requires it positive).
+	ShutdownGrace time.Duration `env:"SHUTDOWN_GRACE" envDefault:"10s"`
 }
 
 // Ledger is the money consumer configuration.

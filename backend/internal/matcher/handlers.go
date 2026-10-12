@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -17,9 +18,15 @@ import (
 	"github.com/aureliusnguyen/pandora/backend/internal/pkg/ids"
 )
 
-// maxIDLen bounds every client-supplied identifier (user_id, market_id,
-// client_order_id, cancel.order_id) and outcome label.
-const maxIDLen = 64
+// Bounds on client-supplied strings. maxIDLen covers every identifier
+// (user_id, market_id, client_order_id, cancel.order_id); the admin strings
+// have their own bounds.
+const (
+	maxIDLen     = 64
+	maxTitleLen  = 256
+	maxLabelLen  = 64
+	maxReasonLen = 1024
+)
 
 var _ matcherv1connect.MatcherServiceHandler = (*Service)(nil)
 
@@ -67,26 +74,37 @@ func (s *Service) requireMarket(id string) (uint32, error) {
 	return n, nil
 }
 
+// Fixed client-facing messages for server-side failures; the underlying
+// error (broker addresses, proto details) is logged, not returned.
+var (
+	errExchangeUnavailable = errors.New("exchange unavailable")
+	errInternal            = errors.New("internal error")
+)
+
 // runnerError maps a Runner.Submit error to a connect error: the caller's
-// own cancellation or deadline keep their codes, a marshal failure is a
-// bug (Internal), everything else (shutdown, WAL produce) is Unavailable.
-func runnerError(err error) error {
+// own cancellation or deadline keep their codes and messages, a marshal
+// failure is a bug (Internal), everything else (shutdown, WAL produce) is
+// Unavailable. Internal and Unavailable carry fixed messages and the
+// underlying error is logged at WARN.
+func runnerError(log *slog.Logger, err error) error {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, err)
 	case errors.Is(err, context.DeadlineExceeded):
 		return connect.NewError(connect.CodeDeadlineExceeded, err)
 	case errors.Is(err, ErrMarshal):
-		return connect.NewError(connect.CodeInternal, err)
+		log.Warn("submit failed", "code", connect.CodeInternal.String(), "err", err)
+		return connect.NewError(connect.CodeInternal, errInternal)
 	}
-	return connect.NewError(connect.CodeUnavailable, err)
+	log.Warn("submit failed", "code", connect.CodeUnavailable.String(), "err", err)
+	return connect.NewError(connect.CodeUnavailable, errExchangeUnavailable)
 }
 
 // submit enqueues and maps runner errors to connect codes.
 func (s *Service) submit(ctx context.Context, cmd *enginev1.Command) (Result, error) {
 	res, err := s.runner.Submit(ctx, cmd)
 	if err != nil {
-		return res, runnerError(err)
+		return res, runnerError(s.o.Log, err)
 	}
 	return res, nil
 }
@@ -104,8 +122,8 @@ func validateSubmit(o *enginev1.SubmitOrder) error {
 		return errors.New("user_id must be 1..64 characters")
 	case !idOK(o.ClientOrderId):
 		return errors.New("client_order_id must be 1..64 characters")
-	case o.OrderId != "" && !ids.Valid(o.OrderId):
-		return errors.New("order_id must be a 26-character ULID when set")
+	case o.OrderId != "":
+		return errors.New("order_id must be empty; the matcher assigns ids")
 	case o.Price < engine.MinPrice || o.Price > engine.MaxPrice:
 		return fmt.Errorf("price %d out of range %d..%d", o.Price, engine.MinPrice, engine.MaxPrice)
 	case o.Qty == 0:
@@ -118,8 +136,8 @@ func validateSubmit(o *enginev1.SubmitOrder) error {
 	return nil
 }
 
-// SubmitOrder validates the order, assigns an id when the request has
-// none, journals and applies it, and reports the engine's verdict in the
+// SubmitOrder validates the order, assigns its id (a client-supplied
+// order_id is rejected), journals and applies it, and reports the engine's verdict in the
 // response status (engine rejections are not connect errors).
 func (s *Service) SubmitOrder(ctx context.Context, req *connect.Request[matcherv1.SubmitOrderRequest]) (*connect.Response[matcherv1.SubmitOrderResponse], error) {
 	defer s.observe("SubmitOrder", time.Now())
@@ -137,13 +155,7 @@ func (s *Service) SubmitOrder(ctx context.Context, req *connect.Request[matcherv
 	if o.Outcome >= n {
 		return nil, invalid(fmt.Sprintf("outcome %d out of range for a %d-outcome market", o.Outcome, n))
 	}
-	if o.OrderId == "" {
-		o.OrderId = s.o.NewID()
-	} else {
-		// ULIDs are case-insensitive; store the canonical uppercase form so
-		// a cancel in either case matches the resting order.
-		o.OrderId = strings.ToUpper(o.OrderId)
-	}
+	o.OrderId = s.o.NewID()
 	res, err := s.submit(ctx, &enginev1.Command{Body: &enginev1.Command_SubmitOrder{SubmitOrder: o}})
 	if err != nil {
 		return nil, err
@@ -206,7 +218,7 @@ func (s *Service) CancelOrder(ctx context.Context, req *connect.Request[matcherv
 		return nil, err
 	}
 	if ids.Valid(c.OrderId) {
-		// Same canonical form SubmitOrder stores.
+		// ULIDs are case-insensitive; ids from NewID are uppercase.
 		c.OrderId = strings.ToUpper(c.OrderId)
 	}
 	if err := requireID("cancel.user_id", c.UserId); err != nil {
@@ -245,10 +257,13 @@ func (s *Service) GetBook(_ context.Context, req *connect.Request[matcherv1.GetB
 	return connect.NewResponse(&matcherv1.GetBookResponse{MarketId: id, MarketSeq: seq, Status: status, Levels: levels}), nil
 }
 
-// validateCreate checks a CreateMarket's id and labels.
+// validateCreate checks a CreateMarket's id, title and labels.
 func validateCreate(cm *enginev1.CreateMarket) error {
 	if err := requireID("create_market.market_id", cm.GetMarketId()); err != nil {
 		return err
+	}
+	if len(cm.GetTitle()) > maxTitleLen {
+		return invalid(fmt.Sprintf("create_market.title must be at most %d characters", maxTitleLen))
 	}
 	// The engine refuses (journals as a no-op) a market with fewer than 2
 	// or more than engine.MaxOutcomes labels; answer InvalidArgument
@@ -258,16 +273,18 @@ func validateCreate(cm *enginev1.CreateMarket) error {
 		return invalid(fmt.Sprintf("create_market needs 2..%d outcome_labels", engine.MaxOutcomes))
 	}
 	for i, l := range labels {
-		if !idOK(l) {
-			return invalid(fmt.Sprintf("outcome_labels[%d] must be 1..%d characters", i, maxIDLen))
+		if l == "" || len(l) > maxLabelLen {
+			return invalid(fmt.Sprintf("outcome_labels[%d] must be 1..%d characters", i, maxLabelLen))
 		}
 	}
 	return nil
 }
 
 // AdminCommand journals a market lifecycle command. Lock, resolve and void
-// require an existing market (resolve also an in-range winning_outcome);
-// create requires an id and 2..engine.MaxOutcomes non-empty labels. M1
+// require an existing market (resolve also an in-range winning_outcome,
+// void a reason of at most maxReasonLen); create requires a new id, a title
+// of at most maxTitleLen and 2..engine.MaxOutcomes labels of 1..maxLabelLen
+// (an existing id is AlreadyExists and is not journaled). M1
 // has no authentication on this RPC: the matcher is reachable only on the
 // cluster network and the gateway does not expose it (auth lands in M4).
 func (s *Service) AdminCommand(ctx context.Context, req *connect.Request[matcherv1.AdminCommandRequest]) (*connect.Response[matcherv1.AdminCommandResponse], error) {
@@ -281,6 +298,9 @@ func (s *Service) AdminCommand(ctx context.Context, req *connect.Request[matcher
 		cm := b.CreateMarket
 		if err := validateCreate(cm); err != nil {
 			return nil, err
+		}
+		if s.runner.HasMarket(cm.GetMarketId()) {
+			return nil, connect.NewError(connect.CodeAlreadyExists, fmt.Errorf("market %q already exists", cm.GetMarketId()))
 		}
 		cmd = &enginev1.Command{Body: &enginev1.Command_CreateMarket{CreateMarket: cm}}
 	case *matcherv1.AdminCommandRequest_LockMarket:
@@ -300,6 +320,9 @@ func (s *Service) AdminCommand(ctx context.Context, req *connect.Request[matcher
 	case *matcherv1.AdminCommandRequest_VoidMarket:
 		if _, err := s.requireMarket(b.VoidMarket.GetMarketId()); err != nil {
 			return nil, err
+		}
+		if len(b.VoidMarket.GetReason()) > maxReasonLen {
+			return nil, invalid(fmt.Sprintf("void_market.reason must be at most %d characters", maxReasonLen))
 		}
 		cmd = &enginev1.Command{Body: &enginev1.Command_VoidMarket{VoidMarket: b.VoidMarket}}
 	default:

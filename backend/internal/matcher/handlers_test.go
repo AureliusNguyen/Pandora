@@ -1,8 +1,10 @@
 package matcher
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,8 +23,17 @@ const validULID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 func newClientT(t *testing.T) (matcherv1connect.MatcherServiceClient, *Service, *FakeWAL) {
 	t.Helper()
+	return newClientIDT(t, nil)
+}
+
+// newClientIDT is newClientT with newID (when non-nil) assigning order ids.
+func newClientIDT(t *testing.T, newID func() string) (matcherv1connect.MatcherServiceClient, *Service, *FakeWAL) {
+	t.Helper()
 	w := NewFakeWAL()
 	svc := newServiceT(t, w, true)
+	if newID != nil {
+		svc.o.NewID = newID // set before any handler goroutine exists
+	}
 	if err := svc.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -76,12 +87,11 @@ func TestSubmitAssignsIDAndMapsStatuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	yes := order("u_bob", commonv1.Side_SIDE_BUY, 60, 4)
-	yes.OrderId = validULID
 	r2, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: yes}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r2.Msg.OrderId != validULID || r2.Msg.Status != commonv1.OrderStatus_ORDER_STATUS_FILLED || len(r2.Msg.Fills) != 1 || r2.Msg.Fills[0].Kind != commonv1.FillKind_FILL_KIND_MINT {
+	if r2.Msg.OrderId == "" || r2.Msg.OrderId == o1 || r2.Msg.Status != commonv1.OrderStatus_ORDER_STATUS_FILLED || len(r2.Msg.Fills) != 1 || r2.Msg.Fills[0].Kind != commonv1.FillKind_FILL_KIND_MINT {
 		t.Fatalf("filled: %+v", r2.Msg)
 	}
 	// bob now holds 4 YES; an IOC sell at 30 transfers against carol's resting 40 bid (o1)
@@ -146,6 +156,9 @@ func TestSubmitErrorCodes(t *testing.T) {
 		}(), connect.CodeNotFound},
 		{"bad order_id", mod(func(o *enginev1.SubmitOrder) { o.OrderId = "given-id" }), connect.CodeInvalidArgument},
 		{"25-char order_id", mod(func(o *enginev1.SubmitOrder) { o.OrderId = validULID[:25] }), connect.CodeInvalidArgument},
+		// The matcher always assigns ids: even a valid ULID is refused.
+		{"given ULID", mod(func(o *enginev1.SubmitOrder) { o.OrderId = validULID }), connect.CodeInvalidArgument},
+		{"given lowercase ULID", mod(func(o *enginev1.SubmitOrder) { o.OrderId = strings.ToLower(validULID) }), connect.CodeInvalidArgument},
 		{"65-char user_id", mod(func(o *enginev1.SubmitOrder) { o.UserId = strings.Repeat("u", 65) }), connect.CodeInvalidArgument},
 		{"65-char market_id", mod(func(o *enginev1.SubmitOrder) { o.MarketId = strings.Repeat("m", 65) }), connect.CodeInvalidArgument},
 		{"empty client_order_id", mod(func(o *enginev1.SubmitOrder) { o.ClientOrderId = "" }), connect.CodeInvalidArgument},
@@ -164,25 +177,16 @@ func TestSubmitErrorCodes(t *testing.T) {
 	if w.AppendCount() != 1 || len(w.Records[0]) != 1 {
 		t.Fatalf("invalid requests were journaled: appends=%d records=%d", w.AppendCount(), len(w.Records[0]))
 	}
-	// 64-char ids and a lowercase ULID are accepted; the ULID is stored in
-	// its canonical uppercase form.
+	// 64-char ids are accepted and the matcher assigns the order id.
 	long := mod(func(o *enginev1.SubmitOrder) {
 		o.UserId = strings.Repeat("u", 64)
 		o.ClientOrderId = strings.Repeat("c", 64)
-		o.OrderId = strings.ToLower(validULID)
 	})
-	if r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: long})); err != nil || r.Msg.OrderId != validULID {
-		t.Fatalf("64-char ids must be accepted with the ULID uppercased: %+v err=%v", r, err)
-	}
-	// A cancel with the lowercase id matches the canonical resting order.
-	cr, err := c.CancelOrder(ctx, connect.NewRequest(&matcherv1.CancelOrderRequest{Cancel: &enginev1.CancelOrder{
-		OrderId: strings.ToLower(validULID), MarketId: DemoMarketID, UserId: strings.Repeat("u", 64),
-	}}))
-	if err != nil || !cr.Msg.Canceled || cr.Msg.CanceledQty != 1 {
-		t.Fatalf("lowercase cancel must match: %+v err=%v", cr, err)
+	if r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: long})); err != nil || r.Msg.OrderId == "" {
+		t.Fatalf("64-char ids must be accepted: %+v err=%v", r, err)
 	}
 	svc.Stop()
-	_, err = c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 50, 1)}))
+	_, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 50, 1)}))
 	if code(err) != connect.CodeUnavailable {
 		t.Fatalf("stopped service must be Unavailable, got %v", err)
 	}
@@ -191,20 +195,54 @@ func TestSubmitErrorCodes(t *testing.T) {
 	}
 }
 
+// Ids from NewID are uppercase ULIDs; a cancel in lowercase still matches.
+func TestLowercaseCancelMatchesAssignedULID(t *testing.T) {
+	c, _, _ := newClientIDT(t, func() string { return validULID })
+	ctx := context.Background()
+	r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 50, 1)}))
+	if err != nil || r.Msg.OrderId != validULID {
+		t.Fatalf("submit: %+v err=%v", r, err)
+	}
+	cr, err := c.CancelOrder(ctx, connect.NewRequest(&matcherv1.CancelOrderRequest{Cancel: &enginev1.CancelOrder{
+		OrderId: strings.ToLower(validULID), MarketId: DemoMarketID, UserId: "u_alice",
+	}}))
+	if err != nil || !cr.Msg.Canceled || cr.Msg.CanceledQty != 1 {
+		t.Fatalf("lowercase cancel must match: %+v err=%v", cr, err)
+	}
+}
+
 func TestRunnerErrorMapping(t *testing.T) {
 	cases := []struct {
-		err  error
-		want connect.Code
+		err     error
+		want    connect.Code
+		wantMsg string // "" means the underlying error's message
 	}{
-		{context.Canceled, connect.CodeCanceled},
-		{context.DeadlineExceeded, connect.CodeDeadlineExceeded},
-		{ErrShuttingDown, connect.CodeUnavailable},
-		{errors.Join(ErrWALProduce, errors.New("broker down")), connect.CodeUnavailable},
-		{errors.Join(ErrMarshal, errors.New("bad proto")), connect.CodeInternal},
+		{context.Canceled, connect.CodeCanceled, ""},
+		{context.DeadlineExceeded, connect.CodeDeadlineExceeded, ""},
+		{ErrShuttingDown, connect.CodeUnavailable, "exchange unavailable"},
+		{errors.Join(ErrWALProduce, errors.New("broker down")), connect.CodeUnavailable, "exchange unavailable"},
+		{errors.Join(ErrMarshal, errors.New("bad proto")), connect.CodeInternal, "internal error"},
 	}
 	for _, tc := range cases {
-		if got := code(runnerError(tc.err)); got != tc.want {
+		var logBuf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&logBuf, nil))
+		err := runnerError(log, tc.err)
+		if got := code(err); got != tc.want {
 			t.Errorf("%v: got %v want %v", tc.err, got, tc.want)
+		}
+		var ce *connect.Error
+		if !errors.As(err, &ce) {
+			t.Fatalf("%v: not a connect error", tc.err)
+		}
+		want := tc.wantMsg
+		if want == "" {
+			want = tc.err.Error()
+		}
+		if ce.Message() != want {
+			t.Errorf("%v: message %q want %q", tc.err, ce.Message(), want)
+		}
+		if tc.wantMsg != "" && (!strings.Contains(logBuf.String(), "level=WARN") || !strings.Contains(logBuf.String(), strings.SplitN(tc.err.Error(), "\n", 2)[0])) {
+			t.Errorf("%v: underlying error not logged at WARN: %q", tc.err, logBuf.String())
 		}
 	}
 }
@@ -281,6 +319,38 @@ func TestCancelGetBookAndAdmin(t *testing.T) {
 	}
 	if got := len(w.Records[0]); got != records {
 		t.Fatalf("rejected create_market was journaled: records %d -> %d", records, got)
+	}
+	// Bounds are inclusive: a 256-char title and 64-char labels are fine.
+	if _, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_CreateMarket{CreateMarket: &enginev1.CreateMarket{
+		MarketId: "mkt_max", Title: strings.Repeat("t", 256), OutcomeLabels: []string{strings.Repeat("l", 64), "B"},
+	}}})); err != nil {
+		t.Fatalf("create at the bounds: %v", err)
+	}
+	records = len(w.Records[0])
+	create := func(cm *enginev1.CreateMarket) *matcherv1.AdminCommandRequest {
+		return &matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_CreateMarket{CreateMarket: cm}}
+	}
+	for _, tc := range []struct {
+		name string
+		req  *matcherv1.AdminCommandRequest
+		want connect.Code
+	}{
+		{"257-char title", create(&enginev1.CreateMarket{MarketId: "bad", Title: strings.Repeat("t", 257), OutcomeLabels: []string{"A", "B"}}), connect.CodeInvalidArgument},
+		{"65-char label", create(&enginev1.CreateMarket{MarketId: "bad", OutcomeLabels: []string{"A", strings.Repeat("l", 65)}}), connect.CodeInvalidArgument},
+		{"1025-char void reason", &matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_VoidMarket{VoidMarket: &enginev1.VoidMarket{
+			MarketId: "mkt_two", Reason: strings.Repeat("r", 1025),
+		}}}, connect.CodeInvalidArgument},
+		{"existing market", create(&enginev1.CreateMarket{MarketId: "mkt_two", Title: "again", OutcomeLabels: []string{"A", "B"}}), connect.CodeAlreadyExists},
+	} {
+		if _, err := c.AdminCommand(ctx, connect.NewRequest(tc.req)); code(err) != tc.want {
+			t.Fatalf("%s: got %v (%v) want %v", tc.name, code(err), err, tc.want)
+		}
+		if got := len(w.Records[0]); got != records {
+			t.Fatalf("%s was journaled: records %d -> %d", tc.name, records, got)
+		}
+	}
+	if svc.Runner().HasMarket("bad") {
+		t.Fatal("rejected create_market reached the engine")
 	}
 	for _, win := range []uint32{2, 7} {
 		if _, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_ResolveMarket{ResolveMarket: &enginev1.ResolveMarket{MarketId: DemoMarketID, WinningOutcome: win}}})); code(err) != connect.CodeInvalidArgument {

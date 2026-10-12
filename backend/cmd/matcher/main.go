@@ -4,10 +4,11 @@
 // HTTP_ADDR (:9001, MatcherService over h2c), METRICS_ADDR (:9090,
 // /metrics, /healthz, /readyz), KAFKA_BROKERS (localhost:19092),
 // OTEL_EXPORTER_OTLP_ENDPOINT (empty disables trace export), LOG_LEVEL
-// (info), ENGINE_PARTITIONS (must be 1 in M1) and DEMO_MARKET (true).
-// SHUTDOWN_GRACE (Go duration, default 10s) bounds how long unpublished
-// events keep being retried after SIGTERM, as one budget for the whole
-// shutdown.
+// (info), ENGINE_PARTITIONS (must be 1 in M1), DEMO_MARKET (true) and
+// SHUTDOWN_GRACE (config.Matcher.ShutdownGrace: a positive Go duration,
+// default 10s) which bounds how long unpublished events keep being retried
+// after SIGTERM, as one budget for the whole shutdown. RPC request bodies
+// are capped at 1 MiB (connect.WithReadMaxBytes).
 //
 // Shutdown worst case (set terminationGracePeriodSeconds above it): the
 // RPC server drains for up to httpx.ShutdownTimeout (10 s), the runner keeps
@@ -18,6 +19,11 @@
 // Startup: ensure the topics (15 s bound), connect the WAL, serve the
 // metrics port (/healthz answers the startup probe during replay), replay
 // engine.wal, then mark /readyz ready and serve RPCs.
+//
+// Retention: engine.wal keeps 7 days and M1 has no snapshots, so replay
+// needs every command since seq 1. A matcher restarted after its oldest
+// journaled command has aged out finds a seq gap and exits 3 (ErrGap) on
+// every start until the topics are recreated; M3 snapshots close this.
 //
 // Security: matcher rpc is unauthenticated in M1 (internal network only;
 // AdminCommand can create, lock, resolve and void markets); never expose
@@ -61,8 +67,8 @@ const (
 	// brokerTimeout bounds each broker round trip at startup (topic
 	// creation, the WAL ping) so a dead broker fails fast instead of hanging.
 	brokerTimeout = 15 * time.Second
-	// defaultShutdownGrace is SHUTDOWN_GRACE when unset.
-	defaultShutdownGrace = 10 * time.Second
+	// maxRequestBytes caps every RPC request body.
+	maxRequestBytes = 1 << 20
 )
 
 // unauthenticatedWarning is logged at startup and mirrored in the package doc.
@@ -77,19 +83,6 @@ const (
 )
 
 func main() { os.Exit(run()) }
-
-// shutdownGrace reads SHUTDOWN_GRACE (a positive Go duration), default 10s.
-func shutdownGrace() (time.Duration, error) {
-	v := os.Getenv("SHUTDOWN_GRACE")
-	if v == "" {
-		return defaultShutdownGrace, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil || d <= 0 {
-		return 0, fmt.Errorf("SHUTDOWN_GRACE must be a positive duration, got %q", v)
-	}
-	return d, nil
-}
 
 // run wires and runs the matcher and returns the process exit code. All
 // cleanup happens in defers here so main can call os.Exit.
@@ -112,9 +105,9 @@ func run() int {
 		log.Error("ENGINE_PARTITIONS must be 1 in M1", "value", cfg.EnginePartitions)
 		return exitError
 	}
-	grace, err := shutdownGrace()
-	if err != nil {
-		log.Error("config", "err", err)
+	grace := cfg.ShutdownGrace
+	if grace <= 0 {
+		log.Error("SHUTDOWN_GRACE must be a positive duration", "value", grace)
 		return exitError
 	}
 	brokers, err := kafkax.CleanBrokers(cfg.Brokers)
@@ -215,7 +208,7 @@ func run() int {
 		return exitError
 	}
 	mux := http.NewServeMux()
-	mux.Handle(matcherv1connect.NewMatcherServiceHandler(svc, connect.WithInterceptors(otelInterceptor)))
+	mux.Handle(matcherv1connect.NewMatcherServiceHandler(svc, connect.WithInterceptors(otelInterceptor), connect.WithReadMaxBytes(maxRequestBytes)))
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           h2c.NewHandler(mux, &http2.Server{}),

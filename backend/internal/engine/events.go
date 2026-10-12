@@ -17,6 +17,11 @@ type touchRef struct {
 // emitter collects the events of the command being applied. It stamps the
 // shared header, numbers idx in emission order, records touched levels for
 // the trailing LevelUpdate events, and decides whether market_seq advances.
+//
+// Emitted MarketCreated, OrderAccepted and OrderRejected events alias the
+// command's own message (the CreateMarket / SubmitOrder pointer) instead of
+// cloning it. This relies on the runner marshaling the command for the WAL
+// before Apply and never mutating the command afterwards.
 type emitter struct {
 	partition uint32
 	seq       uint64

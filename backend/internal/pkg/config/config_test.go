@@ -3,6 +3,7 @@ package config_test
 import (
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/aureliusnguyen/pandora/backend/internal/pkg/config"
 )
@@ -17,7 +18,7 @@ func TestDefaults(t *testing.T) {
 	if m.HTTPAddr != ":9001" || m.MetricsAddr != ":9090" || m.LogLevel != "info" || m.OTLPEndpoint != "" {
 		t.Fatalf("matcher common defaults wrong: %+v", m)
 	}
-	if !slices.Equal(m.Brokers, []string{"localhost:19092"}) || m.EnginePartitions != 1 || !m.DemoMarket {
+	if !slices.Equal(m.Brokers, []string{"localhost:19092"}) || m.EnginePartitions != 1 || !m.DemoMarket || m.ShutdownGrace != 10*time.Second {
 		t.Fatalf("matcher defaults wrong: %+v", m)
 	}
 
@@ -58,12 +59,13 @@ func TestOverrides(t *testing.T) {
 		"ENGINE_PARTITIONS":           "4",
 		"LOG_LEVEL":                   "debug",
 		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
+		"SHUTDOWN_GRACE":              "1m30s",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.HTTPAddr != ":7000" || m.DemoMarket || m.EnginePartitions != 4 || m.LogLevel != "debug" ||
-		m.OTLPEndpoint != "http://collector:4318" || !slices.Equal(m.Brokers, []string{"k1:9092", "k2:9092"}) {
+		m.OTLPEndpoint != "http://collector:4318" || m.ShutdownGrace != 90*time.Second || !slices.Equal(m.Brokers, []string{"k1:9092", "k2:9092"}) {
 		t.Fatalf("overrides not applied: %+v", m)
 	}
 	g, err := config.LoadFrom[config.Gateway](map[string]string{"CORS_ORIGINS": "http://a.test,http://b.test"})
@@ -98,5 +100,8 @@ func TestInvalidValueIsError(t *testing.T) {
 	}
 	if _, err := config.LoadFrom[config.Matcher](map[string]string{"ENGINE_PARTITIONS": "-1"}); err == nil {
 		t.Fatal("want error for ENGINE_PARTITIONS=-1")
+	}
+	if _, err := config.LoadFrom[config.Matcher](map[string]string{"SHUTDOWN_GRACE": "ten"}); err == nil {
+		t.Fatal("want error for SHUTDOWN_GRACE=ten")
 	}
 }
