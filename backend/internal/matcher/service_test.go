@@ -8,7 +8,12 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"connectrpc.com/connect"
 	"github.com/prometheus/client_golang/prometheus"
+
+	commonv1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/common/v1"
+	matcherv1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/matcher/v1"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/ids"
 )
 
 func newServiceT(t *testing.T, w *FakeWAL, demo bool) *Service {
@@ -92,4 +97,18 @@ func TestServiceRunnerOutlivesStartContext(t *testing.T) {
 	}
 	svc.Stop()
 	<-svc.Runner().Done()
+}
+
+// Without NewID the service assigns ULIDs from internal/pkg/ids.
+func TestServiceDefaultsNewIDToULID(t *testing.T) {
+	w := NewFakeWAL()
+	svc := NewService(Options{WAL: w, Metrics: NewMetrics(prometheus.NewRegistry()), Log: slog.Default(), DemoMarket: true})
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(svc.Stop)
+	resp, err := svc.SubmitOrder(context.Background(), connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 40, 1)}))
+	if err != nil || !ids.Valid(resp.Msg.OrderId) {
+		t.Fatalf("order_id %q err=%v", resp.Msg.GetOrderId(), err)
+	}
 }

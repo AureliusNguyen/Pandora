@@ -1,5 +1,11 @@
 // Package matcher sequences commands through the engine.wal Kafka topic,
 // applies them to the deterministic engine and serves MatcherService.
+//
+// Every RPC validates its input (identifier lengths, ULID order ids, price
+// and outcome ranges) before anything is journaled, so the WAL only holds
+// well-formed commands. AdminCommand is unauthenticated in M1: the matcher
+// listens on the cluster network only and the gateway does not forward it;
+// authentication lands in M4.
 package matcher
 
 import (

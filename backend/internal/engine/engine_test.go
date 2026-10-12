@@ -74,3 +74,13 @@ func TestBookUnknownMarketAndPositionDefault(t *testing.T) {
 		t.Fatal("unknown position must be 0")
 	}
 }
+
+func TestOutcomes(t *testing.T) {
+	te := newT(t)
+	if n, ok := te.e.Outcomes("mkt_demo"); !ok || n != 2 {
+		t.Fatalf("Outcomes(mkt_demo) = %d, %v", n, ok)
+	}
+	if _, ok := te.e.Outcomes("ghost"); ok {
+		t.Fatal("unknown market reported outcomes")
+	}
+}

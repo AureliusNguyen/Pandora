@@ -8,6 +8,7 @@ import (
 
 	enginev1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/engine/v1"
 	"github.com/aureliusnguyen/pandora/backend/internal/engine"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/ids"
 )
 
 const (
@@ -18,13 +19,13 @@ const (
 )
 
 // Options wires a Service. NewID assigns order ids when the request has
-// none (main passes ids.New from internal/pkg/ids).
+// none; nil means ids.New.
 type Options struct {
 	Partition  uint32
 	WAL        WAL
 	Metrics    *Metrics
 	Log        *slog.Logger
-	NewID      func() string
+	NewID      func() string // optional, default ids.New
 	DemoMarket bool
 	Now        func() int64        // optional
 	Fatal      func(string, error) // optional (tests)
@@ -41,6 +42,9 @@ type Service struct {
 
 // NewService builds the service and its runner; Start replays and runs it.
 func NewService(o Options) *Service {
+	if o.NewID == nil {
+		o.NewID = ids.New
+	}
 	r := NewRunner(o.Partition, engine.New(o.Partition), o.WAL, o.Metrics, o.Log)
 	if o.Now != nil {
 		r.Now = o.Now

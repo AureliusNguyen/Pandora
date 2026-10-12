@@ -171,10 +171,15 @@ func (r *Runner) Book(marketID string) ([]*commonv1.Level, uint64, commonv1.Mark
 
 // HasMarket reports whether the engine knows marketID.
 func (r *Runner) HasMarket(marketID string) bool {
+	_, ok := r.Outcomes(marketID)
+	return ok
+}
+
+// Outcomes returns marketID's outcome count (ok false when unknown).
+func (r *Runner) Outcomes(marketID string) (uint32, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, _, _, ok := r.eng.Book(marketID)
-	return ok
+	return r.eng.Outcomes(marketID)
 }
 
 func (r *Runner) loop(ctx context.Context) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,9 +17,12 @@ import (
 	"github.com/aureliusnguyen/pandora/backend/gen/go/pandora/matcher/v1/matcherv1connect"
 )
 
-func newClientT(t *testing.T) (matcherv1connect.MatcherServiceClient, *Service) {
+const validULID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+func newClientT(t *testing.T) (matcherv1connect.MatcherServiceClient, *Service, *FakeWAL) {
 	t.Helper()
-	svc := newServiceT(t, NewFakeWAL(), true)
+	w := NewFakeWAL()
+	svc := newServiceT(t, w, true)
 	if err := svc.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +31,7 @@ func newClientT(t *testing.T) (matcherv1connect.MatcherServiceClient, *Service) 
 	mux.Handle(matcherv1connect.NewMatcherServiceHandler(svc))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return matcherv1connect.NewMatcherServiceClient(srv.Client(), srv.URL), svc
+	return matcherv1connect.NewMatcherServiceClient(srv.Client(), srv.URL), svc, w
 }
 
 func order(user string, side commonv1.Side, price uint32, qty uint64) *enginev1.SubmitOrder {
@@ -35,6 +39,13 @@ func order(user string, side commonv1.Side, price uint32, qty uint64) *enginev1.
 		MarketId: DemoMarketID, UserId: user, ClientOrderId: user + "-" + itoa(int(price)) + "-" + itoa(int(qty)),
 		Outcome: 0, Side: side, Price: price, Qty: qty, Tif: commonv1.TimeInForce_TIME_IN_FORCE_GTC,
 	}
+}
+
+// mod returns a valid order after f edited it.
+func mod(f func(o *enginev1.SubmitOrder)) *enginev1.SubmitOrder {
+	o := order("u_alice", commonv1.Side_SIDE_BUY, 50, 1)
+	f(o)
+	return o
 }
 
 func code(err error) connect.Code {
@@ -46,7 +57,7 @@ func code(err error) connect.Code {
 }
 
 func TestSubmitAssignsIDAndMapsStatuses(t *testing.T) {
-	c, _ := newClientT(t)
+	c, _, _ := newClientT(t)
 	ctx := context.Background()
 	r1, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_carol", commonv1.Side_SIDE_BUY, 40, 10)}))
 	if err != nil {
@@ -65,12 +76,12 @@ func TestSubmitAssignsIDAndMapsStatuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	yes := order("u_bob", commonv1.Side_SIDE_BUY, 60, 4)
-	yes.OrderId = "given-id"
+	yes.OrderId = validULID
 	r2, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: yes}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r2.Msg.OrderId != "given-id" || r2.Msg.Status != commonv1.OrderStatus_ORDER_STATUS_FILLED || len(r2.Msg.Fills) != 1 || r2.Msg.Fills[0].Kind != commonv1.FillKind_FILL_KIND_MINT {
+	if r2.Msg.OrderId != validULID || r2.Msg.Status != commonv1.OrderStatus_ORDER_STATUS_FILLED || len(r2.Msg.Fills) != 1 || r2.Msg.Fills[0].Kind != commonv1.FillKind_FILL_KIND_MINT {
 		t.Fatalf("filled: %+v", r2.Msg)
 	}
 	// bob now holds 4 YES; an IOC sell at 30 transfers against carol's resting 40 bid (o1)
@@ -90,7 +101,7 @@ func TestSubmitAssignsIDAndMapsStatuses(t *testing.T) {
 }
 
 func TestSubmitPartialAndCanceledStatuses(t *testing.T) {
-	c, _ := newClientT(t)
+	c, _, _ := newClientT(t)
 	ctx := context.Background()
 	no := order("u_carol", commonv1.Side_SIDE_BUY, 50, 3)
 	no.Outcome = 1
@@ -110,7 +121,7 @@ func TestSubmitPartialAndCanceledStatuses(t *testing.T) {
 }
 
 func TestSubmitErrorCodes(t *testing.T) {
-	c, svc := newClientT(t)
+	c, svc, w := newClientT(t)
 	ctx := context.Background()
 	cases := []struct {
 		name string
@@ -133,6 +144,13 @@ func TestSubmitErrorCodes(t *testing.T) {
 			o.MarketId = "ghost"
 			return o
 		}(), connect.CodeNotFound},
+		{"bad order_id", mod(func(o *enginev1.SubmitOrder) { o.OrderId = "given-id" }), connect.CodeInvalidArgument},
+		{"25-char order_id", mod(func(o *enginev1.SubmitOrder) { o.OrderId = validULID[:25] }), connect.CodeInvalidArgument},
+		{"65-char user_id", mod(func(o *enginev1.SubmitOrder) { o.UserId = strings.Repeat("u", 65) }), connect.CodeInvalidArgument},
+		{"65-char market_id", mod(func(o *enginev1.SubmitOrder) { o.MarketId = strings.Repeat("m", 65) }), connect.CodeInvalidArgument},
+		{"empty client_order_id", mod(func(o *enginev1.SubmitOrder) { o.ClientOrderId = "" }), connect.CodeInvalidArgument},
+		{"65-char client_order_id", mod(func(o *enginev1.SubmitOrder) { o.ClientOrderId = strings.Repeat("c", 65) }), connect.CodeInvalidArgument},
+		{"outcome out of range", mod(func(o *enginev1.SubmitOrder) { o.Outcome = 2 }), connect.CodeInvalidArgument},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -141,6 +159,19 @@ func TestSubmitErrorCodes(t *testing.T) {
 				t.Fatalf("got %v (%v) want %v", code(err), err, tc.want)
 			}
 		})
+	}
+	// Rejected inputs never reach the WAL: only the demo market record exists.
+	if w.AppendCount() != 1 || len(w.Records[0]) != 1 {
+		t.Fatalf("invalid requests were journaled: appends=%d records=%d", w.AppendCount(), len(w.Records[0]))
+	}
+	// 64-char ids and a lowercase ULID are accepted.
+	long := mod(func(o *enginev1.SubmitOrder) {
+		o.UserId = strings.Repeat("u", 64)
+		o.ClientOrderId = strings.Repeat("c", 64)
+		o.OrderId = strings.ToLower(validULID)
+	})
+	if r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: long})); err != nil || r.Msg.OrderId != strings.ToLower(validULID) {
+		t.Fatalf("64-char ids must be accepted: %+v err=%v", r, err)
 	}
 	svc.Stop()
 	_, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 50, 1)}))
@@ -171,7 +202,7 @@ func TestRunnerErrorMapping(t *testing.T) {
 }
 
 func TestCancelGetBookAndAdmin(t *testing.T) {
-	c, _ := newClientT(t)
+	c, svc, _ := newClientT(t)
 	ctx := context.Background()
 	r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 33, 7)}))
 	if err != nil {
@@ -212,12 +243,32 @@ func TestCancelGetBookAndAdmin(t *testing.T) {
 	if _, err := c.CancelOrder(ctx, connect.NewRequest(&matcherv1.CancelOrderRequest{})); code(err) != connect.CodeInvalidArgument {
 		t.Fatalf("empty cancel: %v", err)
 	}
+	for name, cancel := range map[string]*enginev1.CancelOrder{
+		"65-char order_id":  {OrderId: strings.Repeat("o", 65), MarketId: DemoMarketID, UserId: "u_alice"},
+		"65-char user_id":   {OrderId: "x", MarketId: DemoMarketID, UserId: strings.Repeat("u", 65)},
+		"65-char market_id": {OrderId: "x", MarketId: strings.Repeat("m", 65), UserId: "u_alice"},
+	} {
+		if _, err := c.CancelOrder(ctx, connect.NewRequest(&matcherv1.CancelOrderRequest{Cancel: cancel})); code(err) != connect.CodeInvalidArgument {
+			t.Fatalf("cancel %s: %v", name, err)
+		}
+	}
 	ar, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_CreateMarket{CreateMarket: &enginev1.CreateMarket{MarketId: "mkt_two", Title: "two", OutcomeLabels: []string{"A", "B"}}}}))
 	if err != nil || ar.Msg.Seq != 6 {
 		t.Fatalf("create: %+v err=%v", ar.Msg, err)
 	}
-	if _, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_CreateMarket{CreateMarket: &enginev1.CreateMarket{MarketId: "bad", OutcomeLabels: []string{"A"}}}})); code(err) != connect.CodeInvalidArgument {
-		t.Fatalf("create with one label: %v", err)
+	for name, cm := range map[string]*enginev1.CreateMarket{
+		"one label":         {MarketId: "bad", OutcomeLabels: []string{"A"}},
+		"empty label":       {MarketId: "bad", OutcomeLabels: []string{"A", ""}},
+		"nine labels":       {MarketId: "bad", OutcomeLabels: []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}},
+		"no market_id":      {OutcomeLabels: []string{"A", "B"}},
+		"65-char market_id": {MarketId: strings.Repeat("m", 65), OutcomeLabels: []string{"A", "B"}},
+	} {
+		if _, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_CreateMarket{CreateMarket: cm}})); code(err) != connect.CodeInvalidArgument {
+			t.Fatalf("create with %s: %v", name, err)
+		}
+	}
+	if !svc.Runner().HasMarket("mkt_two") || svc.Runner().HasMarket("bad") {
+		t.Fatal("rejected create_market reached the engine")
 	}
 	if _, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_LockMarket{LockMarket: &enginev1.LockMarket{MarketId: "ghost"}}})); code(err) != connect.CodeNotFound {
 		t.Fatalf("lock ghost: %v", err)
@@ -243,7 +294,7 @@ func TestCancelGetBookAndAdmin(t *testing.T) {
 
 // Review Focus 5: GetBook concurrent with applies must be race-free.
 func TestGetBookConcurrentWithSubmits(t *testing.T) {
-	c, _ := newClientT(t)
+	c, _, _ := newClientT(t)
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {

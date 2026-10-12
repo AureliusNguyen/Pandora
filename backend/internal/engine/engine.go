@@ -113,3 +113,13 @@ func (e *Engine) Position(marketID, userID string, outcome uint32) uint64 {
 	}
 	return 0
 }
+
+// Outcomes returns the outcome count of marketID (ok false when unknown),
+// so the RPC layer can reject an out-of-range outcome before journaling.
+func (e *Engine) Outcomes(marketID string) (uint32, bool) {
+	m, found := e.markets[marketID]
+	if !found {
+		return 0, false
+	}
+	return m.n, true
+}

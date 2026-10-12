@@ -53,3 +53,31 @@ func TestNewConcurrentUnique(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+func TestValid(t *testing.T) {
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{ids.New(), true},
+		{"01ARZ3NDEKTSV4RRFFQ69G5FAV", true},
+		{"01arz3ndektsv4rrffq69g5fav", true},  // case-insensitive
+		{"7ZZZZZZZZZZZZZZZZZZZZZZZZZ", true},  // largest encodable
+		{"8ZZZZZZZZZZZZZZZZZZZZZZZZZ", false}, // first char > 7 overflows 128 bits
+		{"", false},
+		{"given-id", false},
+		{"01ARZ3NDEKTSV4RRFFQ69G5FA", false},   // 25 chars
+		{"01ARZ3NDEKTSV4RRFFQ69G5FAVV", false}, // 27 chars
+		{"01ARZ3NDEKTSV4RRFFQ69G5FAI", false},  // I is not Crockford
+		{"01ARZ3NDEKTSV4RRFFQ69G5FAL", false},  // L is not Crockford
+		{"01ARZ3NDEKTSV4RRFFQ69G5FAO", false},  // O is not Crockford
+		{"01ARZ3NDEKTSV4RRFFQ69G5FAU", false},  // U is not Crockford
+		{"01ARZ3NDEKTSV4RRFFQ69G5FA-", false},
+		{"01ARZ3NDEKTSV4RRFFQ69G5F" + "\u00e9", false}, // 26 bytes but non-ASCII
+	}
+	for _, tc := range cases {
+		if got := ids.Valid(tc.id); got != tc.want {
+			t.Errorf("Valid(%q) = %v, want %v", tc.id, got, tc.want)
+		}
+	}
+}
