@@ -25,8 +25,9 @@ type Kafka struct {
 	Brokers []string `env:"KAFKA_BROKERS" envDefault:"localhost:19092" envSeparator:","`
 }
 
-// normalize trims each broker and drops empty entries. Matcher, Ledger and
-// Fanout embed Kafka, so the promoted method covers them too.
+// normalize trims each broker and drops empty entries. Matcher and Ledger
+// embed Kafka, so the promoted method covers them too; Fanout calls it from
+// its own normalize.
 func (k *Kafka) normalize() { k.Brokers = cleanList(k.Brokers) }
 
 // Gateway is the REST edge configuration. CORSOrigins is the browser
@@ -73,12 +74,22 @@ type Ledger struct {
 	PGDSN    string `env:"PG_DSN" envDefault:"postgres://pandora:pandora@localhost:5432/pandora?sslmode=disable"`
 }
 
-// Fanout is the WebSocket edge configuration.
+// Fanout is the WebSocket edge configuration. WSOrigins is the cross-origin
+// browser allowlist for the WebSocket handshake, as host[:port] patterns
+// (path.Match syntax, e.g. "localhost:*").
 type Fanout struct {
 	Common
 	Kafka
-	HTTPAddr    string `env:"HTTP_ADDR" envDefault:":8081"`
-	MatcherAddr string `env:"MATCHER_ADDR" envDefault:"http://localhost:9001"`
+	HTTPAddr    string   `env:"HTTP_ADDR" envDefault:":8081"`
+	MatcherAddr string   `env:"MATCHER_ADDR" envDefault:"http://localhost:9001"`
+	WSOrigins   []string `env:"WS_ORIGINS" envDefault:"localhost:*,127.0.0.1:*" envSeparator:","`
+}
+
+// normalize trims each broker and WS origin and drops empty entries. It
+// shadows the promoted Kafka.normalize, so it calls it explicitly.
+func (f *Fanout) normalize() {
+	f.Kafka.normalize()
+	f.WSOrigins = cleanList(f.WSOrigins)
 }
 
 // Load parses T from the process environment.

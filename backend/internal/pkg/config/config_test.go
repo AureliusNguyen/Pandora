@@ -46,7 +46,8 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.HTTPAddr != ":8081" || f.MatcherAddr != "http://localhost:9001" {
+	if f.HTTPAddr != ":8081" || f.MatcherAddr != "http://localhost:9001" ||
+		!slices.Equal(f.WSOrigins, []string{"localhost:*", "127.0.0.1:*"}) {
 		t.Fatalf("fanout defaults wrong: %+v", f)
 	}
 }
@@ -74,6 +75,17 @@ func TestOverrides(t *testing.T) {
 	}
 	if !slices.Equal(g.CORSOrigins, []string{"http://a.test", "http://b.test"}) {
 		t.Fatalf("CORS_ORIGINS override not applied: %+v", g)
+	}
+	f, err := config.LoadFrom[config.Fanout](map[string]string{
+		"WS_ORIGINS":    " pandora.example.com ,*.pandora.test:*, ",
+		"KAFKA_BROKERS": "k1:9092, k2:9092",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.WSOrigins, []string{"pandora.example.com", "*.pandora.test:*"}) ||
+		!slices.Equal(f.Brokers, []string{"k1:9092", "k2:9092"}) {
+		t.Fatalf("WS_ORIGINS override not applied (or brokers not normalized): %+v", f)
 	}
 }
 
