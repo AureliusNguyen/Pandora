@@ -37,43 +37,6 @@ func (q *Queries) AddPositions(ctx context.Context, arg AddPositionsParams) erro
 	return err
 }
 
-const appliedKeys = `-- name: AppliedKeys :many
-SELECT partition, seq, idx FROM event_log
-WHERE (partition, seq, idx) IN (SELECT unnest($1::int[]), unnest($2::bigint[]), unnest($3::int[]))
-`
-
-type AppliedKeysParams struct {
-	Partitions []int32
-	Seqs       []int64
-	Idxs       []int32
-}
-
-type AppliedKeysRow struct {
-	Partition int32
-	Seq       int64
-	Idx       int32
-}
-
-func (q *Queries) AppliedKeys(ctx context.Context, arg AppliedKeysParams) ([]AppliedKeysRow, error) {
-	rows, err := q.db.Query(ctx, appliedKeys, arg.Partitions, arg.Seqs, arg.Idxs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []AppliedKeysRow
-	for rows.Next() {
-		var i AppliedKeysRow
-		if err := rows.Scan(&i.Partition, &i.Seq, &i.Idx); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const applyWalletDeltas = `-- name: ApplyWalletDeltas :exec
 UPDATE wallets w SET balance_cents = w.balance_cents + v.delta, version = w.version + 1
 FROM (SELECT unnest($1::text[]) AS user_id, unnest($2::bigint[]) AS delta) AS v
@@ -104,6 +67,48 @@ type CancelOrderParams struct {
 func (q *Queries) CancelOrder(ctx context.Context, arg CancelOrderParams) error {
 	_, err := q.db.Exec(ctx, cancelOrder, arg.Qty, arg.ID)
 	return err
+}
+
+const claimKeys = `-- name: ClaimKeys :many
+INSERT INTO event_log (partition, seq, idx)
+SELECT unnest($1::int[]), unnest($2::bigint[]), unnest($3::int[])
+ON CONFLICT DO NOTHING
+RETURNING partition, seq, idx
+`
+
+type ClaimKeysParams struct {
+	Partitions []int32
+	Seqs       []int64
+	Idxs       []int32
+}
+
+type ClaimKeysRow struct {
+	Partition int32
+	Seq       int64
+	Idx       int32
+}
+
+// ClaimKeys is the first write of every batch transaction. A concurrent
+// transaction inserting the same key waits on the unique index until this one
+// ends, then conflicts and gets no row back, so it applies nothing.
+func (q *Queries) ClaimKeys(ctx context.Context, arg ClaimKeysParams) ([]ClaimKeysRow, error) {
+	rows, err := q.db.Query(ctx, claimKeys, arg.Partitions, arg.Seqs, arg.Idxs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClaimKeysRow
+	for rows.Next() {
+		var i ClaimKeysRow
+		if err := rows.Scan(&i.Partition, &i.Seq, &i.Idx); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const ensureAccounts = `-- name: EnsureAccounts :exec
@@ -267,7 +272,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (user_id, client_order_id) DO UPDATE SET
   id = EXCLUDED.id, market_id = EXCLUDED.market_id, outcome = EXCLUDED.outcome, side = EXCLUDED.side,
   price = EXCLUDED.price, qty = EXCLUDED.qty, remaining = EXCLUDED.remaining, status = EXCLUDED.status,
-  tif = EXCLUDED.tif, seq = EXCLUDED.seq, updated_at = now()
+  tif = EXCLUDED.tif, seq = EXCLUDED.seq, created_at = now(), updated_at = now()
 WHERE orders.status = 'rejected'
 `
 
@@ -354,21 +359,15 @@ func (q *Queries) LockWallets(ctx context.Context, userIds []string) ([]string, 
 	return items, nil
 }
 
-const markApplied = `-- name: MarkApplied :exec
-INSERT INTO event_log (partition, seq, idx)
-SELECT unnest($1::int[]), unnest($2::bigint[]), unnest($3::int[])
-ON CONFLICT DO NOTHING
+const marketStatus = `-- name: MarketStatus :one
+SELECT status FROM markets WHERE id = $1
 `
 
-type MarkAppliedParams struct {
-	Partitions []int32
-	Seqs       []int64
-	Idxs       []int32
-}
-
-func (q *Queries) MarkApplied(ctx context.Context, arg MarkAppliedParams) error {
-	_, err := q.db.Exec(ctx, markApplied, arg.Partitions, arg.Seqs, arg.Idxs)
-	return err
+func (q *Queries) MarketStatus(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRow(ctx, marketStatus, id)
+	var status string
+	err := row.Scan(&status)
+	return status, err
 }
 
 const openPositions = `-- name: OpenPositions :many

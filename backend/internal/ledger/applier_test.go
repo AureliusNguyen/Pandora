@@ -263,3 +263,68 @@ func TestNilEventAdvancesOffset(t *testing.T) {
 		t.Fatalf("offsets = %v txns = %d", r.offsets, len(r.txns))
 	}
 }
+
+// Dedup is claim-first: the first write of every batch claims the event keys,
+// and only claimed events are applied, so a concurrent transaction that
+// already claimed (and committed) a key makes this one apply nothing.
+func TestClaimKeysIsFirstWriteAndGatesApply(t *testing.T) {
+	r := newFakeRepo()
+	evs := mintEvents()
+	for _, e := range evs {
+		r.applied[keyOf(e)] = true // claimed by another consumer's committed txn
+	}
+	apply(t, r, evs...)
+	if len(r.calls) < 2 || r.calls[0] != "InTx" || r.calls[1] != "ClaimKeys" {
+		t.Fatalf("first Tx call must be ClaimKeys, got %v", r.calls)
+	}
+	if len(r.txns) != 0 || len(r.wallets) != 0 || len(r.positions) != 0 || len(r.orders) != 0 {
+		t.Fatalf("pre-claimed batch applied: txns=%d wallets=%v", len(r.txns), r.wallets)
+	}
+	if r.offsets["pandora-ledger/0"] != 4 {
+		t.Fatalf("offsets = %v", r.offsets)
+	}
+}
+
+// uint32 leg prices 101 + (2^32-1) wrap to 100; validation must use int64
+// and require each price in 1..99, skipping the fill as malformed.
+func TestMintPriceWrapIsMalformed(t *testing.T) {
+	r := newFakeRepo()
+	before := testutil.ToFloat64(malformedEvents)
+	apply(t, r, at(3, 1, fill("fw", commonv1.FillKind_FILL_KIND_MINT, 1,
+		leg("o_a", "u_alice", 0, buy, 101, false), leg("o_b", "u_bob", 1, buy, 4294967295, true))))
+	if len(r.txns) != 0 || len(r.wallets) != 0 || !r.applied[EventKey{0, 3, 1}] {
+		t.Fatalf("wrapping mint applied: txns=%d wallets=%v", len(r.txns), r.wallets)
+	}
+	if got := testutil.ToFloat64(malformedEvents) - before; got != 1 {
+		t.Fatalf("malformed counter grew by %v, want 1", got)
+	}
+	apply(t, r, at(4, 1, fill("fz", commonv1.FillKind_FILL_KIND_MINT, 1,
+		leg("o_a", "u_alice", 0, buy, 0, false), leg("o_b", "u_bob", 1, buy, 100, true))))
+	if len(r.txns) != 0 {
+		t.Fatal("zero-priced mint leg must be malformed")
+	}
+}
+
+func TestSecondSettlementIsNoop(t *testing.T) {
+	r := newFakeRepo()
+	evs := append(mintEvents(),
+		at(6, 0, &enginev1.Event{Body: &enginev1.Event_MarketResolved{MarketResolved: &enginev1.MarketResolved{WinningOutcome: 0}}}),
+		at(7, 0, &enginev1.Event{Body: &enginev1.Event_MarketResolved{MarketResolved: &enginev1.MarketResolved{WinningOutcome: 1}}}),
+		at(8, 0, &enginev1.Event{Body: &enginev1.Event_MarketVoided{MarketVoided: &enginev1.MarketVoided{Reason: "late"}}}),
+	)
+	apply(t, r, evs...)
+	if len(r.settlements) != 1 || len(r.txns) != 2 {
+		t.Fatalf("settlements=%d txns=%d, want 1 and 2", len(r.settlements), len(r.txns))
+	}
+	if m := r.markets[mkt]; m.Status != "resolved" || *m.Winning != 0 {
+		t.Fatalf("market = %+v", m)
+	}
+	if r.wallets["u_alice"] != 400 || r.wallets["u_bob"] != -400 {
+		t.Fatalf("wallets = %v", r.wallets)
+	}
+	for _, k := range []EventKey{{0, 7, 0}, {0, 8, 0}} {
+		if !r.applied[k] {
+			t.Fatalf("ignored settlement %v not marked applied", k)
+		}
+	}
+}

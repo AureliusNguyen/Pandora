@@ -1,11 +1,14 @@
--- name: AppliedKeys :many
-SELECT partition, seq, idx FROM event_log
-WHERE (partition, seq, idx) IN (SELECT unnest(@partitions::int[]), unnest(@seqs::bigint[]), unnest(@idxs::int[]));
-
--- name: MarkApplied :exec
+-- ClaimKeys is the first write of every batch transaction. A concurrent
+-- transaction inserting the same key waits on the unique index until this one
+-- ends, then conflicts and gets no row back, so it applies nothing.
+-- name: ClaimKeys :many
 INSERT INTO event_log (partition, seq, idx)
 SELECT unnest(@partitions::int[]), unnest(@seqs::bigint[]), unnest(@idxs::int[])
-ON CONFLICT DO NOTHING;
+ON CONFLICT DO NOTHING
+RETURNING partition, seq, idx;
+
+-- name: MarketStatus :one
+SELECT status FROM markets WHERE id = @id;
 
 -- name: EnsureUsers :exec
 INSERT INTO users (id, display_name) SELECT unnest(@ids::text[]), unnest(@ids::text[]) ON CONFLICT DO NOTHING;
@@ -39,7 +42,7 @@ VALUES (@id, @user_id, @market_id, @client_order_id, @outcome, @side, @price, @q
 ON CONFLICT (user_id, client_order_id) DO UPDATE SET
   id = EXCLUDED.id, market_id = EXCLUDED.market_id, outcome = EXCLUDED.outcome, side = EXCLUDED.side,
   price = EXCLUDED.price, qty = EXCLUDED.qty, remaining = EXCLUDED.remaining, status = EXCLUDED.status,
-  tif = EXCLUDED.tif, seq = EXCLUDED.seq, updated_at = now()
+  tif = EXCLUDED.tif, seq = EXCLUDED.seq, created_at = now(), updated_at = now()
 WHERE orders.status = 'rejected';
 
 -- name: FillOrder :exec

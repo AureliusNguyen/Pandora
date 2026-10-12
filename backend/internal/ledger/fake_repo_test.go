@@ -39,6 +39,7 @@ type fakeRepo struct {
 	wallets     map[string]int64
 	offsets     map[string]int64
 	settlements []Settlement
+	calls       []string // Tx method names in call order
 }
 
 func newFakeRepo() *fakeRepo {
@@ -51,20 +52,37 @@ func newFakeRepo() *fakeRepo {
 }
 
 func (f *fakeRepo) InTx(ctx context.Context, fn func(context.Context, Tx) error) error {
+	f.calls = append(f.calls, "InTx")
 	return fn(ctx, f)
 }
 
-func (f *fakeRepo) AppliedKeys(_ context.Context, keys []EventKey) (map[EventKey]bool, error) {
+// ClaimKeys mirrors INSERT INTO event_log ... ON CONFLICT DO NOTHING
+// RETURNING: only keys not yet present (including earlier in the same call)
+// come back. Like the rest of the fake, it does not roll back on error.
+func (f *fakeRepo) ClaimKeys(_ context.Context, keys []EventKey) (map[EventKey]bool, error) {
+	f.calls = append(f.calls, "ClaimKeys")
 	out := map[EventKey]bool{}
 	for _, k := range keys {
-		if f.applied[k] {
+		if !f.applied[k] {
+			f.applied[k] = true
 			out[k] = true
 		}
 	}
 	return out, nil
 }
 
+// MarketStatus mirrors SELECT status FROM markets WHERE id = $1.
+func (f *fakeRepo) MarketStatus(_ context.Context, id string) (string, bool, error) {
+	f.calls = append(f.calls, "MarketStatus")
+	m, ok := f.markets[id]
+	if !ok {
+		return "", false, nil
+	}
+	return m.Status, true, nil
+}
+
 func (f *fakeRepo) EnsureUsers(_ context.Context, ids []string) error {
+	f.calls = append(f.calls, "EnsureUsers")
 	for _, id := range ids {
 		if !f.users[id] {
 			f.users[id] = true
@@ -76,6 +94,7 @@ func (f *fakeRepo) EnsureUsers(_ context.Context, ids []string) error {
 }
 
 func (f *fakeRepo) EnsureEscrow(_ context.Context, ids []string) error {
+	f.calls = append(f.calls, "EnsureEscrow")
 	for _, id := range ids {
 		f.accounts[EscrowAccount(id)] = true
 	}
@@ -84,6 +103,7 @@ func (f *fakeRepo) EnsureEscrow(_ context.Context, ids []string) error {
 
 // UpsertMarket mirrors ON CONFLICT (id) DO UPDATE: a re-upsert keeps status.
 func (f *fakeRepo) UpsertMarket(_ context.Context, m MarketRow) error {
+	f.calls = append(f.calls, "UpsertMarket")
 	if old, ok := f.markets[m.ID]; ok {
 		old.Outcomes = m.Outcomes
 	} else {
@@ -96,6 +116,7 @@ func (f *fakeRepo) UpsertMarket(_ context.Context, m MarketRow) error {
 // SetMarketStatus mirrors an UPDATE: a missing market is a no-op, and only
 // ResolveMarket (w != nil) writes the winning outcome.
 func (f *fakeRepo) SetMarketStatus(_ context.Context, id, status string, w *int32) error {
+	f.calls = append(f.calls, "SetMarketStatus")
 	m, ok := f.markets[id]
 	if !ok {
 		return nil
@@ -111,6 +132,7 @@ func (f *fakeRepo) SetMarketStatus(_ context.Context, id, status string, w *int3
 // WHERE orders.status = 'rejected': a rejected row is replaced, any other
 // existing row wins, and a bare primary-key clash is an error.
 func (f *fakeRepo) InsertOrder(_ context.Context, o OrderRow) error {
+	f.calls = append(f.calls, "InsertOrder")
 	ck := o.UserID + "/" + o.ClientOrderID
 	if oldID, ok := f.coids[ck]; ok {
 		if f.orders[oldID].Status != "rejected" {
@@ -127,6 +149,7 @@ func (f *fakeRepo) InsertOrder(_ context.Context, o OrderRow) error {
 }
 
 func (f *fakeRepo) FillOrder(_ context.Context, id string, qty int64) error {
+	f.calls = append(f.calls, "FillOrder")
 	if o, ok := f.orders[id]; ok {
 		o.Remaining = max(o.Remaining-qty, 0)
 		o.Status = "partially_filled"
@@ -138,6 +161,7 @@ func (f *fakeRepo) FillOrder(_ context.Context, id string, qty int64) error {
 }
 
 func (f *fakeRepo) CancelOrder(_ context.Context, id string, qty int64) error {
+	f.calls = append(f.calls, "CancelOrder")
 	if o, ok := f.orders[id]; ok {
 		o.Remaining = max(o.Remaining-qty, 0)
 		if o.Remaining == 0 {
@@ -149,6 +173,7 @@ func (f *fakeRepo) CancelOrder(_ context.Context, id string, qty int64) error {
 
 // InsertFills mirrors ON CONFLICT DO NOTHING: existing keys are skipped.
 func (f *fakeRepo) InsertFills(_ context.Context, fills []FillRow) error {
+	f.calls = append(f.calls, "InsertFills")
 	for _, r := range fills {
 		if _, ok := f.fills[r.Key]; !ok {
 			f.fills[r.Key] = r
@@ -158,6 +183,7 @@ func (f *fakeRepo) InsertFills(_ context.Context, fills []FillRow) error {
 }
 
 func (f *fakeRepo) InsertLedgerTxns(_ context.Context, txns []JournalTxn) error {
+	f.calls = append(f.calls, "InsertLedgerTxns")
 	for _, t := range txns {
 		if f.txnKeys[t.Key] {
 			continue
@@ -182,6 +208,7 @@ func (f *fakeRepo) InsertLedgerTxns(_ context.Context, txns []JournalTxn) error 
 }
 
 func (f *fakeRepo) AddPositions(_ context.Context, ds []PositionDelta) error {
+	f.calls = append(f.calls, "AddPositions")
 	for _, d := range ds {
 		p := f.positions[d.PositionKey]
 		if p == nil {
@@ -195,6 +222,7 @@ func (f *fakeRepo) AddPositions(_ context.Context, ds []PositionDelta) error {
 }
 
 func (f *fakeRepo) OpenPositions(_ context.Context, marketID string) ([]Position, error) {
+	f.calls = append(f.calls, "OpenPositions")
 	var out []Position
 	for k, p := range f.positions {
 		if k.MarketID == marketID && !p.Settled {
@@ -206,6 +234,7 @@ func (f *fakeRepo) OpenPositions(_ context.Context, marketID string) ([]Position
 }
 
 func (f *fakeRepo) SettlePositions(_ context.Context, marketID string) error {
+	f.calls = append(f.calls, "SettlePositions")
 	for k, p := range f.positions {
 		if k.MarketID == marketID {
 			p.Settled = true
@@ -215,6 +244,7 @@ func (f *fakeRepo) SettlePositions(_ context.Context, marketID string) error {
 }
 
 func (f *fakeRepo) ApplyWalletDeltas(_ context.Context, ds []WalletDelta) error {
+	f.calls = append(f.calls, "ApplyWalletDeltas")
 	for i, d := range ds {
 		if i > 0 && ds[i-1].UserID >= d.UserID {
 			return fmt.Errorf("wallet deltas not in lock order at %s", d.UserID)
@@ -227,15 +257,9 @@ func (f *fakeRepo) ApplyWalletDeltas(_ context.Context, ds []WalletDelta) error 
 	return nil
 }
 
-func (f *fakeRepo) MarkApplied(_ context.Context, keys []EventKey) error {
-	for _, k := range keys {
-		f.applied[k] = true
-	}
-	return nil
-}
-
 // UpsertOffset mirrors GREATEST(old, new): stored offsets never regress.
 func (f *fakeRepo) UpsertOffset(_ context.Context, c string, p int32, off int64) error {
+	f.calls = append(f.calls, "UpsertOffset")
 	k := fmt.Sprintf("%s/%d", c, p)
 	f.offsets[k] = max(f.offsets[k], off)
 	return nil

@@ -115,7 +115,13 @@ type MarketRow struct {
 
 // Tx is everything the applier needs inside one database transaction.
 type Tx interface {
-	AppliedKeys(ctx context.Context, keys []EventKey) (map[EventKey]bool, error)
+	// ClaimKeys must be the first write of the transaction: it inserts the
+	// keys into event_log (ON CONFLICT DO NOTHING) and returns only those this
+	// transaction inserted. A concurrent transaction claiming the same keys
+	// blocks on the unique index until this one ends, then gets none back.
+	ClaimKeys(ctx context.Context, keys []EventKey) (map[EventKey]bool, error)
+	// MarketStatus returns the market's status and whether the market exists.
+	MarketStatus(ctx context.Context, marketID string) (status string, ok bool, err error)
 	EnsureUsers(ctx context.Context, userIDs []string) error
 	EnsureEscrow(ctx context.Context, marketIDs []string) error
 	UpsertMarket(ctx context.Context, m MarketRow) error
@@ -130,7 +136,6 @@ type Tx interface {
 	SettlePositions(ctx context.Context, marketID string) error
 	// ApplyWalletDeltas receives deltas sorted by UserID (account-id lock order).
 	ApplyWalletDeltas(ctx context.Context, deltas []WalletDelta) error
-	MarkApplied(ctx context.Context, keys []EventKey) error
 	UpsertOffset(ctx context.Context, consumer string, partition int32, nextOffset int64) error
 }
 

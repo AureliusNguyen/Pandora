@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -34,17 +35,25 @@ func splitKeys(keys []EventKey) (ps []int32, ss []int64, is []int32) {
 	return ps, ss, is
 }
 
-func (t *pgTx) AppliedKeys(ctx context.Context, keys []EventKey) (map[EventKey]bool, error) {
+func (t *pgTx) ClaimKeys(ctx context.Context, keys []EventKey) (map[EventKey]bool, error) {
 	out := map[EventKey]bool{}
 	if len(keys) == 0 {
 		return out, nil
 	}
 	ps, ss, is := splitKeys(keys)
-	rows, err := t.q.AppliedKeys(ctx, db.AppliedKeysParams{Partitions: ps, Seqs: ss, Idxs: is})
+	rows, err := t.q.ClaimKeys(ctx, db.ClaimKeysParams{Partitions: ps, Seqs: ss, Idxs: is})
 	for _, r := range rows {
 		out[EventKey{r.Partition, r.Seq, r.Idx}] = true
 	}
 	return out, err
+}
+
+func (t *pgTx) MarketStatus(ctx context.Context, marketID string) (string, bool, error) {
+	status, err := t.q.MarketStatus(ctx, marketID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return status, err == nil, err
 }
 
 func (t *pgTx) EnsureUsers(ctx context.Context, ids []string) error {
@@ -186,15 +195,14 @@ func (t *pgTx) ApplyWalletDeltas(ctx context.Context, ds []WalletDelta) error {
 	for _, d := range ds {
 		p.UserIds, p.Deltas = append(p.UserIds, d.UserID), append(p.Deltas, d.DeltaCents)
 	}
-	if _, err := t.q.LockWallets(ctx, p.UserIds); err != nil { // FOR UPDATE in user/account-id order
+	locked, err := t.q.LockWallets(ctx, p.UserIds) // FOR UPDATE in user/account-id order
+	if err != nil {
 		return err
 	}
+	if len(locked) != len(p.UserIds) {
+		return fmt.Errorf("wallets: locked %d of %d rows (missing wallet)", len(locked), len(p.UserIds))
+	}
 	return t.q.ApplyWalletDeltas(ctx, p)
-}
-
-func (t *pgTx) MarkApplied(ctx context.Context, keys []EventKey) error {
-	ps, ss, is := splitKeys(keys)
-	return t.q.MarkApplied(ctx, db.MarkAppliedParams{Partitions: ps, Seqs: ss, Idxs: is})
 }
 
 func (t *pgTx) UpsertOffset(ctx context.Context, c string, p int32, off int64) error {

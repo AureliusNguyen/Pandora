@@ -66,7 +66,6 @@ func relevant(ev *enginev1.Event) bool {
 
 type batchState struct {
 	seen    map[EventKey]bool
-	keys    []EventKey
 	users   map[string]struct{}
 	escrows map[string]struct{}
 	txns    []JournalTxn
@@ -93,9 +92,16 @@ func (b *batchState) addPos(user, market string, outcome uint32, qty, cost int64
 	d.CostCents += cost
 }
 
-// ApplyBatch applies all records in one transaction: dedup, per-event rules,
-// aggregated flush, event_log, consumer_offsets. Every envelope, including
-// one with a nil Event, advances its partition's stored offset.
+// ApplyBatch applies all records in one transaction: claim keys in event_log,
+// per-event rules for the claimed events only, aggregated flush,
+// consumer_offsets. Every envelope, including one with a nil Event, advances
+// its partition's stored offset.
+//
+// Dedup is claim-first: the event_log insert is the first write, so two
+// transactions applying the same batch (a redelivery racing the original,
+// two group members after a rebalance) serialize on event_log's unique index
+// and the loser applies nothing. Skipped malformed and ignored events stay
+// claimed, so they are never retried.
 func (a *Applier) ApplyBatch(ctx context.Context, batch []Envelope) error {
 	if len(batch) == 0 {
 		return nil
@@ -107,20 +113,22 @@ func (a *Applier) ApplyBatch(ctx context.Context, batch []Envelope) error {
 				keys = append(keys, keyOf(env.Event))
 			}
 		}
-		applied, err := tx.AppliedKeys(ctx, keys)
-		if err != nil {
-			return fmt.Errorf("applied keys: %w", err)
+		claimed := map[EventKey]bool{}
+		if len(keys) > 0 {
+			var err error
+			if claimed, err = tx.ClaimKeys(ctx, keys); err != nil {
+				return fmt.Errorf("claim keys: %w", err)
+			}
 		}
 		b := newBatchState()
 		offsets := map[int32]int64{}
 		for _, env := range batch {
 			offsets[env.KafkaPartition] = max(offsets[env.KafkaPartition], env.Offset+1)
 			k := keyOf(env.Event)
-			if !relevant(env.Event) || applied[k] || b.seen[k] {
+			if !relevant(env.Event) || !claimed[k] || b.seen[k] {
 				continue
 			}
 			b.seen[k] = true
-			b.keys = append(b.keys, k)
 			if err := a.applyEvent(ctx, tx, b, k, env.Event); err != nil {
 				if errors.Is(err, errMalformed) {
 					malformedEvents.Inc()
@@ -132,11 +140,6 @@ func (a *Applier) ApplyBatch(ctx context.Context, batch []Envelope) error {
 		}
 		if err := a.flush(ctx, tx, b); err != nil {
 			return err
-		}
-		if len(b.keys) > 0 {
-			if err := tx.MarkApplied(ctx, b.keys); err != nil {
-				return fmt.Errorf("mark applied: %w", err)
-			}
 		}
 		for _, p := range slices.Sorted(maps.Keys(offsets)) {
 			if err := tx.UpsertOffset(ctx, ConsumerName, p, offsets[p]); err != nil {
@@ -180,8 +183,14 @@ func (a *Applier) applyEvent(ctx context.Context, tx Tx, b *batchState, k EventK
 	case *enginev1.Event_MarketLocked:
 		return tx.SetMarketStatus(ctx, ev.GetMarketId(), "locked", nil)
 	case *enginev1.Event_MarketResolved:
+		if done, err := a.alreadySettled(ctx, tx, k, ev.GetMarketId()); done || err != nil {
+			return err
+		}
 		return a.settle(ctx, tx, b, k, ev.GetMarketId(), int32(body.MarketResolved.GetWinningOutcome()))
 	case *enginev1.Event_MarketVoided:
+		if done, err := a.alreadySettled(ctx, tx, k, ev.GetMarketId()); done || err != nil {
+			return err
+		}
 		return a.void(ctx, tx, b, k, ev.GetMarketId())
 	}
 	return nil
@@ -227,9 +236,13 @@ func (a *Applier) applyFill(ctx context.Context, tx Tx, b *batchState, k EventKe
 		b.addPos(seller.GetUserId(), market, seller.GetOutcome(), -q, -amt)
 		kind = "fill"
 	case commonv1.FillKind_FILL_KIND_MINT:
-		var sum uint32
+		// Sum in int64 and bound each price: uint32 prices can wrap to 100.
+		var sum int64
 		for _, l := range legs {
-			sum += l.GetPrice()
+			if p := l.GetPrice(); p < 1 || p > 99 {
+				return fmt.Errorf("%w: mint leg price %d outside 1..99", errMalformed, p)
+			}
+			sum += int64(l.GetPrice())
 		}
 		if len(legs) < 2 || sum != 100 {
 			return fmt.Errorf("%w: mint leg prices sum to %d", errMalformed, sum)
@@ -282,6 +295,21 @@ func (a *Applier) flushPositions(ctx context.Context, tx Tx, b *batchState) erro
 	})
 	b.pos = map[PositionKey]*PositionDelta{}
 	return tx.AddPositions(ctx, ds)
+}
+
+// alreadySettled reports whether market is already resolved or voided. A
+// second MarketResolved/MarketVoided is then a logged no-op: no txn, no
+// settlements row, resolution_outcome untouched; its key stays claimed.
+func (a *Applier) alreadySettled(ctx context.Context, tx Tx, k EventKey, market string) (bool, error) {
+	status, ok, err := tx.MarketStatus(ctx, market)
+	if err != nil {
+		return false, fmt.Errorf("market status: %w", err)
+	}
+	if ok && (status == "resolved" || status == "voided") {
+		a.log.Warn("ignoring settlement of an already settled market", "key", k, "market", market, "status", status)
+		return true, nil
+	}
+	return false, nil
 }
 
 func (a *Applier) settle(ctx context.Context, tx Tx, b *batchState, k EventKey, market string, winning int32) error {

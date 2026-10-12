@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -58,18 +59,19 @@ func Decode(recs []*kgo.Record, log *slog.Logger) []Envelope {
 	return out
 }
 
-// NewKafkaClient returns a manual-commit group consumer of engine.events
-// that starts from the earliest offset when the group has none.
-func NewKafkaClient(brokers []string) (*kgo.Client, error) {
-	return kgo.NewClient(
+// consumerOpts are the group-consumer options for engine.events: manual
+// commits, earliest offset when the group has none, and rebalances blocked
+// while a polled batch is processed (see Run for why that is not relied on).
+func consumerOpts(brokers []string) []kgo.Opt {
+	return []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(ConsumerName),
 		kgo.ConsumeTopics(eventsTopic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
 		kgo.BlockRebalanceOnPoll(),
-		kgo.FetchMaxWait(100*time.Millisecond),
-	)
+		kgo.FetchMaxWait(100 * time.Millisecond),
+	}
 }
 
 // Consumer feeds polled engine.events batches to an Applier.
@@ -77,11 +79,62 @@ type Consumer struct {
 	cl  *kgo.Client
 	app *Applier
 	log *slog.Logger
+
+	mu   sync.Mutex
+	gone map[int32]bool // engine.events partitions lost or revoked since the last poll
 }
 
-// NewConsumer returns a Consumer reading from cl and applying through app.
-func NewConsumer(cl *kgo.Client, app *Applier, log *slog.Logger) *Consumer {
-	return &Consumer{cl: cl, app: app, log: log}
+// NewConsumer creates the pandora-ledger group client for brokers and returns
+// a Consumer applying through app. Close releases the client.
+func NewConsumer(brokers []string, app *Applier, log *slog.Logger) (*Consumer, error) {
+	c := &Consumer{app: app, log: log, gone: map[int32]bool{}}
+	opts := append(consumerOpts(brokers), kgo.OnPartitionsLost(c.onGone), kgo.OnPartitionsRevoked(c.onGone))
+	cl, err := kgo.NewClient(opts...)
+	if err != nil {
+		return nil, err
+	}
+	c.cl = cl
+	return c, nil
+}
+
+// Close leaves the group and closes the Kafka client.
+func (c *Consumer) Close() { c.cl.Close() }
+
+// onGone records partitions this member no longer owns (OnPartitionsLost and
+// OnPartitionsRevoked), so Run stops retrying their in-flight records instead
+// of racing the new owner.
+func (c *Consumer) onGone(_ context.Context, _ *kgo.Client, m map[string][]int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range m[eventsTopic] {
+		c.gone[p] = true
+	}
+}
+
+// takeGone returns and clears the partitions recorded by onGone.
+func (c *Consumer) takeGone() map[int32]bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g := c.gone
+	c.gone = map[int32]bool{}
+	return g
+}
+
+// withoutPartitions drops the envelopes and records of gone partitions.
+func withoutPartitions(envs []Envelope, recs []*kgo.Record, gone map[int32]bool) ([]Envelope, []*kgo.Record) {
+	keptEnvs := envs[:0:0]
+	for _, e := range envs {
+		if !gone[e.KafkaPartition] {
+			keptEnvs = append(keptEnvs, e)
+		}
+	}
+	keptRecs := recs[:0:0]
+	for _, r := range recs {
+		if !gone[r.Partition] {
+			keptRecs = append(keptRecs, r)
+		}
+	}
+	return keptEnvs, keptRecs
 }
 
 // offsetRanges formats the per-partition offset span of recs, e.g. "0:7-8".
@@ -103,12 +156,21 @@ func offsetRanges(recs []*kgo.Record) string {
 // Run polls up to 1000 records, applies them in one PG txn, then commits
 // Kafka offsets. It returns only when ctx ends.
 //
+// Exactly-once effect comes from claim-first dedup in ApplyBatch, not from
+// the group protocol: BlockRebalanceOnPoll holds a rebalance only up to the
+// rebalance timeout, after which another member can own the partition and
+// apply the same records. Both transactions then race on event_log's unique
+// index and the loser applies nothing, so the ledger is never double-applied.
+//
 // Stall, not corrupt: a batch that fails in Postgres for any reason other
 // than decoding (malformed events are skipped by the applier) is retried
 // forever with backoff from 100 ms doubling to 5 s, logging the partition
-// and offset range and incrementing pandora_ledger_batch_retries_total, with
-// rebalances blocked meanwhile. Money events are never skipped; isolating a
-// poison record into a dead_events table is an M3/M4 follow-up.
+// and offset range and incrementing pandora_ledger_batch_retries_total.
+// Money events are never skipped; isolating a poison record into a
+// dead_events table is an M3/M4 follow-up. Between retries rebalances are
+// allowed, so OnPartitionsLost/OnPartitionsRevoked can run; records of
+// partitions this member no longer owns are dropped from the retry (the new
+// owner re-reads them from the committed offset).
 func (c *Consumer) Run(ctx context.Context) error {
 	for {
 		fetches := c.cl.PollRecords(ctx, 1000)
@@ -119,33 +181,56 @@ func (c *Consumer) Run(ctx context.Context) error {
 			c.log.Warn("fetch error", "topic", topic, "partition", p, "err", err)
 		})
 		recs := fetches.Records()
+		// Polled records belong to partitions owned now: callbacks cannot run
+		// between this poll and the next AllowRebalance.
+		c.takeGone()
 		if len(recs) == 0 {
 			c.cl.AllowRebalance()
 			continue
 		}
 		envs := Decode(recs, c.log)
 		batchSize.Observe(float64(len(envs)))
-		backoff := 100 * time.Millisecond
-		for {
-			start := time.Now()
-			err := c.app.ApplyBatch(ctx, envs)
-			if err == nil {
-				applySeconds.Observe(time.Since(start).Seconds())
-				break
-			}
-			batchRetries.Inc()
-			c.log.Error("apply batch failed, retrying", "offsets", offsetRanges(recs), "err", err, "backoff", backoff)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-			backoff = min(backoff*2, 5*time.Second)
+		recs, err := c.applyWithRetry(ctx, envs, recs)
+		if err != nil {
+			return err
 		}
-		if err := c.cl.CommitRecords(ctx, recs...); err != nil {
-			// Safe: PG already holds the batch; a redelivery is deduped by event_log.
-			c.log.Warn("kafka commit failed", "err", err)
+		if len(recs) > 0 {
+			if err := c.cl.CommitRecords(ctx, recs...); err != nil {
+				// Safe: PG already holds the batch; a redelivery is deduped by event_log.
+				c.log.Warn("kafka commit failed", "err", err)
+			}
 		}
 		c.cl.AllowRebalance()
+	}
+}
+
+// applyWithRetry applies envs until it commits, ctx ends, or every partition
+// in the batch is gone. It returns the records still owned (to commit).
+func (c *Consumer) applyWithRetry(ctx context.Context, envs []Envelope, recs []*kgo.Record) ([]*kgo.Record, error) {
+	backoff := 100 * time.Millisecond
+	for {
+		start := time.Now()
+		err := c.app.ApplyBatch(ctx, envs)
+		if err == nil {
+			applySeconds.Observe(time.Since(start).Seconds())
+			return recs, nil
+		}
+		batchRetries.Inc()
+		c.log.Error("apply batch failed, retrying", "offsets", offsetRanges(recs), "err", err, "backoff", backoff)
+		c.cl.AllowRebalance() // let a pending rebalance and its Lost/Revoked callbacks run
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if gone := c.takeGone(); len(gone) > 0 {
+			envs, recs = withoutPartitions(envs, recs, gone)
+			c.log.Warn("partitions lost or revoked, dropping their in-flight records",
+				"partitions", slices.Sorted(maps.Keys(gone)), "remaining", offsetRanges(recs))
+			if len(recs) == 0 {
+				return nil, nil
+			}
+		}
+		backoff = min(backoff*2, 5*time.Second)
 	}
 }

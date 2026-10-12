@@ -91,12 +91,12 @@ func run(invariantsOnly bool) int {
 		log.Error("kafka brokers", "err", err)
 		return 2
 	}
-	cl, err := ledger.NewKafkaClient(brokers)
+	consumer, err := ledger.NewConsumer(brokers, ledger.NewApplier(ledger.NewPGRepo(pool), log), log)
 	if err != nil {
 		log.Error("kafka", "err", err)
 		return 2
 	}
-	defer cl.Close()
+	defer consumer.Close()
 
 	// internal/ledger registers pandora_ledger_* with promauto on the default
 	// registry; serve it next to the otelx registry. otelx already has the Go
@@ -117,7 +117,7 @@ func run(invariantsOnly bool) int {
 	}()
 	ready.SetReady(true)
 	log.Info("ledger consuming", "topic", "engine.events", "group", ledger.ConsumerName)
-	runErr := ledger.NewConsumer(cl, ledger.NewApplier(ledger.NewPGRepo(pool), log), log).Run(ctx)
+	runErr := consumer.Run(ctx)
 	interrupted := ctx.Err() != nil
 	ready.SetReady(false)
 	stop()

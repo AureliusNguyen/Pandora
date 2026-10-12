@@ -128,3 +128,113 @@ func TestPGRejectThenAcceptSameCOIDAndOffsetNeverRegresses(t *testing.T) {
 		t.Fatalf("offset = %d, want 4", n)
 	}
 }
+
+// holdRepo wraps PGRepo so the transaction pauses right after ClaimKeys
+// until released, holding its event_log rows uncommitted.
+type holdRepo struct {
+	inner   *PGRepo
+	claimed chan struct{}
+	release chan struct{}
+}
+
+type holdTx struct {
+	Tx
+	r *holdRepo
+}
+
+func (h *holdRepo) InTx(ctx context.Context, fn func(context.Context, Tx) error) error {
+	return h.inner.InTx(ctx, func(ctx context.Context, tx Tx) error {
+		return fn(ctx, &holdTx{Tx: tx, r: h})
+	})
+}
+
+func (t *holdTx) ClaimKeys(ctx context.Context, keys []EventKey) (map[EventKey]bool, error) {
+	got, err := t.Tx.ClaimKeys(ctx, keys)
+	close(t.r.claimed)
+	<-t.r.release
+	return got, err
+}
+
+// Two transactions applying the same batch at once (a rebalance that let a
+// second member take the partition) must apply it exactly once.
+func TestPGConcurrentSameBatchAppliesOnce(t *testing.T) {
+	pool := startPG(t)
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	evs := append(mintEvents(), at(6, 0, &enginev1.Event{Body: &enginev1.Event_MarketResolved{
+		MarketResolved: &enginev1.MarketResolved{WinningOutcome: 0},
+	}}))
+	hold := &holdRepo{inner: NewPGRepo(pool), claimed: make(chan struct{}), release: make(chan struct{})}
+	errA, errB := make(chan error, 1), make(chan error, 1)
+	go func() { errA <- NewApplier(hold, log).ApplyBatch(ctx, batch(evs...)) }()
+	<-hold.claimed // A holds its uncommitted claim
+	go func() { errB <- NewApplier(NewPGRepo(pool), log).ApplyBatch(ctx, batch(evs...)) }()
+	// Wait until B is blocked on A's event_log rows, then let A commit.
+	deadline := time.Now().Add(30 * time.Second)
+	for count(t, pool, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'") < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("second transaction never blocked on the claim")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	close(hold.release)
+	if err := <-errA; err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if err := <-errB; err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	if n := count(t, pool, "SELECT balance_cents FROM wallets WHERE user_id='u_alice'"); n != 1000000-600+1000 {
+		t.Fatalf("alice = %d", n)
+	}
+	if n := count(t, pool, "SELECT balance_cents FROM wallets WHERE user_id='u_bob'"); n != 1000000-400 {
+		t.Fatalf("bob = %d", n)
+	}
+	if n := count(t, pool, "SELECT COALESCE(SUM(qty),0) FROM positions WHERE market_id='mkt_t'"); n != 20 {
+		t.Fatalf("position qty = %d, want 20", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM ledger_entries e JOIN ledger_txns x ON x.id = e.txn_id WHERE x.kind IN ('mint','settle')"); n != 5 {
+		t.Fatalf("entries = %d, want 5 (3 mint + 2 settle)", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM settlements"); n != 1 {
+		t.Fatalf("settlements = %d", n)
+	}
+	if n := count(t, pool, "SELECT remaining FROM orders WHERE id='o_a'"); n != 0 {
+		t.Fatalf("maker remaining = %d", n)
+	}
+	vs, err := CheckInvariants(ctx, pool)
+	if err != nil || len(vs) != 0 {
+		t.Fatalf("invariants: %v %+v", err, vs)
+	}
+}
+
+func TestPGApplyWalletDeltasMissingWalletFails(t *testing.T) {
+	pool := startPG(t)
+	err := NewPGRepo(pool).InTx(context.Background(), func(ctx context.Context, tx Tx) error {
+		return tx.ApplyWalletDeltas(ctx, []WalletDelta{{UserID: "u_alice", DeltaCents: 0}, {UserID: "u_nobody", DeltaCents: 5}})
+	})
+	if err == nil {
+		t.Fatal("missing wallet must fail the transaction")
+	}
+}
+
+func TestPGSecondResolutionIsNoop(t *testing.T) {
+	pool := startPG(t)
+	ctx := context.Background()
+	evs := append(mintEvents(),
+		at(6, 0, &enginev1.Event{Body: &enginev1.Event_MarketResolved{MarketResolved: &enginev1.MarketResolved{WinningOutcome: 0}}}),
+		at(7, 0, &enginev1.Event{Body: &enginev1.Event_MarketResolved{MarketResolved: &enginev1.MarketResolved{WinningOutcome: 1}}}),
+	)
+	if err := NewApplier(NewPGRepo(pool), slog.New(slog.NewTextHandler(io.Discard, nil))).ApplyBatch(ctx, batch(evs...)); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM settlements"); n != 1 {
+		t.Fatalf("settlements = %d", n)
+	}
+	if n := count(t, pool, "SELECT resolution_outcome::bigint FROM markets WHERE id='mkt_t'"); n != 0 {
+		t.Fatalf("resolution_outcome = %d", n)
+	}
+	if n := count(t, pool, "SELECT count(*) FROM event_log WHERE seq = 7"); n != 1 {
+		t.Fatal("ignored resolution not claimed")
+	}
+}
