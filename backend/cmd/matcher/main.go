@@ -13,6 +13,11 @@
 // metrics port (/healthz answers the startup probe during replay), replay
 // engine.wal, then mark /readyz ready and serve RPCs.
 //
+// Security: matcher rpc is unauthenticated in M1 (internal network only;
+// AdminCommand can create, lock, resolve and void markets); never expose
+// this port outside the cluster; auth lands in M4. The same sentence is
+// logged as a WARN at startup.
+//
 // Exit codes: 0 clean stop (including SIGTERM during replay), 3 WAL seq gap
 // or a WAL produce that failed after retries (the runner exits 3 itself),
 // 1 anything else (bad config, broker unreachable, port in use).
@@ -53,6 +58,10 @@ const (
 	// defaultShutdownGrace is SHUTDOWN_GRACE when unset.
 	defaultShutdownGrace = 10 * time.Second
 )
+
+// unauthenticatedWarning is logged at startup and mirrored in the package doc.
+const unauthenticatedWarning = "matcher rpc is unauthenticated in M1 (internal network only; " +
+	"AdminCommand can create, lock, resolve and void markets); never expose this port outside the cluster; auth lands in M4"
 
 // Process exit codes.
 const (
@@ -203,6 +212,7 @@ func run() int {
 	}
 	ready.SetReady(svc.Ready())
 
+	log.Warn(unauthenticatedWarning, "addr", cfg.HTTPAddr)
 	log.Info("matcher listening", "addr", cfg.HTTPAddr, "metrics", cfg.MetricsAddr, "shutdown_grace", grace)
 	// Blocks until SIGTERM/SIGINT or a bind failure, then shuts srv down
 	// gracefully (in-flight RPCs finish before the runner stops).
