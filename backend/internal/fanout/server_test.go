@@ -57,4 +57,17 @@ func TestWebSocketRoundTrip(t *testing.T) {
 	if m := read(); m["type"] != "error" {
 		t.Fatalf("error = %v", m)
 	}
+	// A malformed frame gets an error frame and the connection stays usable.
+	if err := conn.Write(ctx, websocket.MessageText, []byte("{")); err != nil {
+		t.Fatal(err)
+	}
+	if m := read(); m["type"] != "error" || m["message"] != "malformed message" {
+		t.Fatalf("malformed = %v", m)
+	}
+	if err := wsjson.Write(ctx, conn, ClientMsg{Type: "ping"}); err != nil {
+		t.Fatal(err)
+	}
+	if m := read(); m["type"] != "pong" {
+		t.Fatalf("pong after malformed = %v", m)
+	}
 }
