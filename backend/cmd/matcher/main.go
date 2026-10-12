@@ -1,0 +1,219 @@
+// Command matcher runs the sequencer + matching engine for partition 0.
+//
+// Configuration comes from the environment (internal/pkg/config.Matcher):
+// HTTP_ADDR (:9001, MatcherService over h2c), METRICS_ADDR (:9090,
+// /metrics, /healthz, /readyz), KAFKA_BROKERS (localhost:19092),
+// OTEL_EXPORTER_OTLP_ENDPOINT (empty disables trace export), LOG_LEVEL
+// (info), ENGINE_PARTITIONS (must be 1 in M1) and DEMO_MARKET (true).
+// SHUTDOWN_GRACE (Go duration, default 10s) bounds how long unpublished
+// events keep being retried after SIGTERM, as one budget for the whole
+// shutdown.
+//
+// Startup: ensure the topics (15 s bound), connect the WAL, serve the
+// metrics port (/healthz answers the startup probe during replay), replay
+// engine.wal, then mark /readyz ready and serve RPCs.
+//
+// Exit codes: 0 clean stop (including SIGTERM during replay), 3 WAL seq gap
+// or a WAL produce that failed after retries (the runner exits 3 itself),
+// 1 anything else (bad config, broker unreachable, port in use).
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
+	"github.com/aureliusnguyen/pandora/backend/gen/go/pandora/matcher/v1/matcherv1connect"
+	"github.com/aureliusnguyen/pandora/backend/internal/matcher"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/config"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/httpx"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/ids"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/kafkax"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/logx"
+	"github.com/aureliusnguyen/pandora/backend/internal/pkg/otelx"
+)
+
+// version is overridden at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
+const (
+	// brokerTimeout bounds each broker round trip at startup (topic
+	// creation, the WAL ping) so a dead broker fails fast instead of hanging.
+	brokerTimeout = 15 * time.Second
+	// defaultShutdownGrace is SHUTDOWN_GRACE when unset.
+	defaultShutdownGrace = 10 * time.Second
+)
+
+// Process exit codes.
+const (
+	exitOK    = 0
+	exitError = 1
+	exitWAL   = 3
+)
+
+func main() { os.Exit(run()) }
+
+// shutdownGrace reads SHUTDOWN_GRACE (a positive Go duration), default 10s.
+func shutdownGrace() (time.Duration, error) {
+	v := os.Getenv("SHUTDOWN_GRACE")
+	if v == "" {
+		return defaultShutdownGrace, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("SHUTDOWN_GRACE must be a positive duration, got %q", v)
+	}
+	return d, nil
+}
+
+// run wires and runs the matcher and returns the process exit code. All
+// cleanup happens in defers here so main can call os.Exit.
+func run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := config.Load[config.Matcher]()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitError
+	}
+	log, err := logx.Setup("matcher", cfg.LogLevel)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitError
+	}
+	log = log.With("version", version)
+	if cfg.EnginePartitions != 1 {
+		log.Error("ENGINE_PARTITIONS must be 1 in M1", "value", cfg.EnginePartitions)
+		return exitError
+	}
+	grace, err := shutdownGrace()
+	if err != nil {
+		log.Error("config", "err", err)
+		return exitError
+	}
+	brokers, err := kafkax.CleanBrokers(cfg.Brokers)
+	if err != nil {
+		log.Error("kafka brokers", "err", err)
+		return exitError
+	}
+
+	tel, err := otelx.Setup(ctx, otelx.Options{ServiceName: "matcher", OTLPEndpoint: cfg.OTLPEndpoint})
+	if err != nil {
+		log.Error("otel setup", "err", err)
+		return exitError
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tel.Shutdown(sctx); err != nil {
+			log.Warn("otel shutdown", "err", err)
+		}
+	}()
+
+	tctx, tcancel := context.WithTimeout(ctx, brokerTimeout)
+	err = kafkax.EnsureTopics(tctx, brokers, kafkax.M1Topics())
+	tcancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Info("stopped before startup completed")
+			return exitOK
+		}
+		log.Error("ensure topics", "err", err)
+		return exitError
+	}
+	wctx, wcancel := context.WithTimeout(ctx, brokerTimeout)
+	wal, err := matcher.NewKafkaWAL(wctx, brokers, log)
+	wcancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			log.Info("stopped before startup completed")
+			return exitOK
+		}
+		log.Error("kafka wal", "err", err)
+		return exitError
+	}
+	defer wal.Close()
+
+	svc := matcher.NewService(matcher.Options{
+		Partition: 0, WAL: wal, Metrics: matcher.NewMetrics(tel.Registry), Log: log,
+		NewID: ids.New, DemoMarket: cfg.DemoMarket, ShutdownGrace: grace,
+	})
+
+	// The metrics server runs during replay so /healthz answers the startup
+	// probe; /readyz stays 503 until Start returns. A bind failure on it
+	// stops the whole process (via stop) and is reported as exit 1.
+	var ready httpx.Readiness
+	opsErr := make(chan error, 1)
+	go func() {
+		err := httpx.Run(ctx, httpx.NewMetricsServer(cfg.MetricsAddr, tel.Registry, &ready))
+		if err != nil {
+			stop()
+		}
+		opsErr <- err
+	}()
+	// stopOps stops the metrics server and returns its error (nil when it
+	// stopped cleanly).
+	stopOps := func() error {
+		stop()
+		return <-opsErr
+	}
+
+	if err := svc.Start(ctx); err != nil {
+		svc.Stop()
+		if opErr := stopOps(); opErr != nil {
+			log.Error("metrics server", "err", opErr)
+			return exitError
+		}
+		if errors.Is(err, matcher.ErrGap) {
+			log.Error("start", "err", err)
+			return exitWAL
+		}
+		if ctx.Err() != nil {
+			log.Info("stopped during replay", "err", err)
+			return exitOK
+		}
+		log.Error("start", "err", err)
+		return exitError
+	}
+
+	otelInterceptor, err := otelconnect.NewInterceptor()
+	if err != nil {
+		log.Error("otelconnect", "err", err)
+		svc.Stop()
+		_ = stopOps()
+		return exitError
+	}
+	mux := http.NewServeMux()
+	mux.Handle(matcherv1connect.NewMatcherServiceHandler(svc, connect.WithInterceptors(otelInterceptor)))
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           h2c.NewHandler(mux, &http2.Server{}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	ready.SetReady(svc.Ready())
+
+	log.Info("matcher listening", "addr", cfg.HTTPAddr, "metrics", cfg.MetricsAddr, "shutdown_grace", grace)
+	// Blocks until SIGTERM/SIGINT or a bind failure, then shuts srv down
+	// gracefully (in-flight RPCs finish before the runner stops).
+	runErr := httpx.Run(ctx, srv)
+	ready.SetReady(false)
+	svc.Stop()
+	runErr = errors.Join(runErr, stopOps())
+	if runErr != nil {
+		log.Error("server", "err", runErr)
+		return exitError
+	}
+	log.Info("matcher stopped")
+	return exitOK
+}
