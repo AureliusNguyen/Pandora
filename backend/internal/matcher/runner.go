@@ -28,6 +28,9 @@ var (
 	// retries. The runner then calls Fatal: the broker may hold part of the
 	// batch, so the only safe recovery is a restart that replays the journal.
 	ErrWALProduce = errors.New("matcher: wal produce failed")
+	// ErrMarshal wraps a command that could not be marshaled; nothing was
+	// journaled. Handlers map it to CodeInternal.
+	ErrMarshal = errors.New("matcher: marshal command")
 )
 
 // walRetries is how many times a failed WAL append is retried before the
@@ -233,7 +236,7 @@ func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) {
 		b, err := proto.Marshal(q.cmd)
 		if err != nil {
 			// Only a malformed proto can do this; nothing was journaled.
-			failAll(batch, fmt.Errorf("marshal command: %w", err))
+			failAll(batch, fmt.Errorf("%w: %w", ErrMarshal, err))
 			return
 		}
 		values = append(values, b)
