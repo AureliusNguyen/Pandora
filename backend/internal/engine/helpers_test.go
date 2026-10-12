@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -146,3 +147,7 @@ func wantBook(t *testing.T, e *Engine, market string, want ...string) {
 		t.Fatalf("book:\n got %v\nwant %v", got, want)
 	}
 }
+
+func itoa(v uint64) string { return strconv.FormatUint(v, 10) }
+
+func trimSpace(s string) string { return strings.TrimSpace(s) }
