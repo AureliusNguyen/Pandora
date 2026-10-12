@@ -13,6 +13,7 @@ import (
 
 	"connectrpc.com/connect"
 	"connectrpc.com/otelconnect"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	enginev1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/engine/v1"
 	matcherv1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/matcher/v1"
@@ -39,7 +40,7 @@ const (
 type Server struct {
 	matcher matcherv1connect.MatcherServiceClient
 	log     *slog.Logger
-	origins []string // CORS allowlist; nil means DefaultAllowedOrigins (Task 6)
+	origins []string // CORS allowlist; nil means DefaultAllowedOrigins
 }
 
 // NewServer returns a Server that forwards to the matcher client m.
@@ -186,5 +187,18 @@ func (s *Server) listMarkets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, []MarketJSON{{ID: DemoMarketID, Title: demoTitle, Status: marketStatus(b.GetStatus()), Outcomes: []string{"YES", "NO"}}})
 }
 
-// Handler returns the routed mux; Task 6 adds CORS, logging, metrics and OTel.
-func (s *Server) Handler() http.Handler { return s.Routes() }
+// WithAllowedOrigins sets the CORS allowlist (cmd/gateway passes
+// config.Gateway.CORSOrigins). Empty keeps DefaultAllowedOrigins.
+func (s *Server) WithAllowedOrigins(origins []string) *Server {
+	s.origins = origins
+	return s
+}
+
+// Handler is otelhttp -> CORS -> observe -> mux.
+func (s *Server) Handler() http.Handler {
+	origins := s.origins
+	if len(origins) == 0 {
+		origins = DefaultAllowedOrigins
+	}
+	return otelhttp.NewHandler(withCORS(origins, observe(s.log, s.Routes())), "gateway")
+}
