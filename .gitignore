@@ -37,3 +37,7 @@ backend/.cache/
 
 # k6 / load artifacts
 backend/load/results/
+
+# Local worktrees and SDD scratch
+.worktrees/
+.superpowers/
