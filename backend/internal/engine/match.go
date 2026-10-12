@@ -44,13 +44,13 @@ type plannedFill struct {
 	kind   commonv1.FillKind
 	price  uint32 // taker leg price
 	qty    uint64
-	makers [maxOutcomes]*order // TRANSFER: makers[0]; MINT: makers[j] for every j != taker outcome
+	makers [MaxOutcomes]*order // TRANSFER: makers[0]; MINT: makers[j] for every j != taker outcome
 }
 
 // planner buffers are reused across commands so planning does not allocate.
 type planner struct {
 	fills   []plannedFill
-	cursors [maxOutcomes]cursor
+	cursors [MaxOutcomes]cursor
 	ask     cursor
 	filled  uint64
 	stp     bool // the walk stopped because the next maker is the taker's own order

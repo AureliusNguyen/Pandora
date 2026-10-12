@@ -30,8 +30,9 @@ type Options struct {
 	DemoMarket bool
 	Now        func() int64        // optional
 	Fatal      func(string, error) // optional (tests)
-	// ShutdownGrace bounds how long an events publish keeps retrying after
-	// Stop; 0 means closeFlushTimeout (10 s). cmd/matcher may set it.
+	// ShutdownGrace bounds how long event publishes keep retrying after
+	// Stop, as one budget for the whole shutdown (not per batch); 0 means
+	// closeFlushTimeout (10 s). cmd/matcher sets it from SHUTDOWN_GRACE.
 	ShutdownGrace time.Duration
 }
 

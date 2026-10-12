@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -16,14 +17,9 @@ import (
 	"github.com/aureliusnguyen/pandora/backend/internal/pkg/ids"
 )
 
-const (
-	// maxIDLen bounds every client-supplied identifier (user_id, market_id,
-	// client_order_id, cancel.order_id) and outcome label.
-	maxIDLen = 64
-	// maxOutcomes mirrors the engine's per-market cap (CreateMarket with
-	// more labels would be silently ignored by the engine).
-	maxOutcomes = 8
-)
+// maxIDLen bounds every client-supplied identifier (user_id, market_id,
+// client_order_id, cancel.order_id) and outcome label.
+const maxIDLen = 64
 
 var _ matcherv1connect.MatcherServiceHandler = (*Service)(nil)
 
@@ -143,6 +139,10 @@ func (s *Service) SubmitOrder(ctx context.Context, req *connect.Request[matcherv
 	}
 	if o.OrderId == "" {
 		o.OrderId = s.o.NewID()
+	} else {
+		// ULIDs are case-insensitive; store the canonical uppercase form so
+		// a cancel in either case matches the resting order.
+		o.OrderId = strings.ToUpper(o.OrderId)
 	}
 	res, err := s.submit(ctx, &enginev1.Command{Body: &enginev1.Command_SubmitOrder{SubmitOrder: o}})
 	if err != nil {
@@ -205,6 +205,10 @@ func (s *Service) CancelOrder(ctx context.Context, req *connect.Request[matcherv
 	if err := requireID("cancel.order_id", c.OrderId); err != nil {
 		return nil, err
 	}
+	if ids.Valid(c.OrderId) {
+		// Same canonical form SubmitOrder stores.
+		c.OrderId = strings.ToUpper(c.OrderId)
+	}
 	if err := requireID("cancel.user_id", c.UserId); err != nil {
 		return nil, err
 	}
@@ -246,9 +250,12 @@ func validateCreate(cm *enginev1.CreateMarket) error {
 	if err := requireID("create_market.market_id", cm.GetMarketId()); err != nil {
 		return err
 	}
+	// The engine refuses (journals as a no-op) a market with fewer than 2
+	// or more than engine.MaxOutcomes labels; answer InvalidArgument
+	// instead of journaling a command that creates nothing.
 	labels := cm.GetOutcomeLabels()
-	if len(labels) < 2 || len(labels) > maxOutcomes {
-		return invalid(fmt.Sprintf("create_market needs 2..%d outcome_labels", maxOutcomes))
+	if len(labels) < 2 || len(labels) > engine.MaxOutcomes {
+		return invalid(fmt.Sprintf("create_market needs 2..%d outcome_labels", engine.MaxOutcomes))
 	}
 	for i, l := range labels {
 		if !idOK(l) {
@@ -259,10 +266,10 @@ func validateCreate(cm *enginev1.CreateMarket) error {
 }
 
 // AdminCommand journals a market lifecycle command. Lock, resolve and void
-// require an existing market; create requires an id and 2..8 non-empty
-// labels. M1 has no authentication on this RPC: the matcher is reachable
-// only on the cluster network and the gateway does not expose it (auth
-// lands in M4).
+// require an existing market (resolve also an in-range winning_outcome);
+// create requires an id and 2..engine.MaxOutcomes non-empty labels. M1
+// has no authentication on this RPC: the matcher is reachable only on the
+// cluster network and the gateway does not expose it (auth lands in M4).
 func (s *Service) AdminCommand(ctx context.Context, req *connect.Request[matcherv1.AdminCommandRequest]) (*connect.Response[matcherv1.AdminCommandResponse], error) {
 	defer s.observe("AdminCommand", time.Now())
 	if err := s.checkReady(); err != nil {
@@ -282,8 +289,12 @@ func (s *Service) AdminCommand(ctx context.Context, req *connect.Request[matcher
 		}
 		cmd = &enginev1.Command{Body: &enginev1.Command_LockMarket{LockMarket: b.LockMarket}}
 	case *matcherv1.AdminCommandRequest_ResolveMarket:
-		if _, err := s.requireMarket(b.ResolveMarket.GetMarketId()); err != nil {
+		n, err := s.requireMarket(b.ResolveMarket.GetMarketId())
+		if err != nil {
 			return nil, err
+		}
+		if w := b.ResolveMarket.GetWinningOutcome(); w >= n {
+			return nil, invalid(fmt.Sprintf("winning_outcome %d out of range for a %d-outcome market", w, n))
 		}
 		cmd = &enginev1.Command{Body: &enginev1.Command_ResolveMarket{ResolveMarket: b.ResolveMarket}}
 	case *matcherv1.AdminCommandRequest_VoidMarket:

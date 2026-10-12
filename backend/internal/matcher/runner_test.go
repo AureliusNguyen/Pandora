@@ -349,6 +349,54 @@ func TestRunnerShutdownDuringPublishRetryFailsPending(t *testing.T) {
 	}
 }
 
+// The grace is one shutdown-wide budget and the loop exits after the first
+// batch that fails with ErrShuttingDown: with several batches queued behind
+// a failing publish, Stop still returns within about one grace and the
+// queued commands are never journaled.
+func TestRunnerShutdownGraceIsShutdownWide(t *testing.T) {
+	r, w, fr, cancel := newRunnerT(t)
+	const grace = 200 * time.Millisecond
+	r.shutdownGrace = grace
+	ctx := context.Background()
+	w.SetFailPublish(errors.New("events down"))
+	first := make(chan error, 1)
+	go func() {
+		_, err := r.Submit(ctx, &enginev1.Command{Body: createCmd(0).Body})
+		first <- err
+	}()
+	waitFor(t, "a publish failure", func() bool { return testutil.ToFloat64(r.m.PublishFailures) >= 1 })
+	// Three more full batches queue behind the stuck one; each command
+	// creates a distinct market so every batch has events to publish.
+	const queued = 3 * MaxBatch
+	errs := make(chan error, queued)
+	for i := 0; i < queued; i++ {
+		go func() {
+			_, err := r.Submit(ctx, &enginev1.Command{Body: &enginev1.Command_CreateMarket{CreateMarket: &enginev1.CreateMarket{
+				MarketId: "mkt_q" + itoa(i), Title: "q", OutcomeLabels: []string{"YES", "NO"},
+			}}})
+			errs <- err
+		}()
+	}
+	waitFor(t, "the queued batches", func() bool { return len(r.reqs) == queued })
+	start := time.Now()
+	cancel()
+	<-r.Done()
+	if elapsed := time.Since(start); elapsed > 2*grace {
+		t.Fatalf("stop took %v with %d queued batches, want about one grace (%v)", elapsed, queued/MaxBatch, grace)
+	}
+	if err := <-first; !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("stuck batch: expected ErrShuttingDown, got %v", err)
+	}
+	for i := 0; i < queued; i++ {
+		if err := <-errs; !errors.Is(err, ErrShuttingDown) {
+			t.Fatalf("queued request %d: expected ErrShuttingDown, got %v", i, err)
+		}
+	}
+	if fr.count() != 0 || len(w.Records[0]) != 1 || r.eng.LastSeq() != 1 {
+		t.Fatalf("fatal=%d wal=%d last=%d", fr.count(), len(w.Records[0]), r.eng.LastSeq())
+	}
+}
+
 // A publish that succeeds within the grace completes the waiters normally.
 func TestRunnerPublishSucceedsWithinShutdownGrace(t *testing.T) {
 	r, w, fr, cancel := newRunnerT(t)

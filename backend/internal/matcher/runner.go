@@ -99,9 +99,13 @@ type Runner struct {
 	mu             sync.Mutex // guards eng for Book/HasMarket readers
 	walBackoff     backoff
 	publishBackoff backoff
-	// shutdownGrace bounds how long a publish keeps retrying after the
-	// runner ctx is canceled (Options.ShutdownGrace, default closeFlushTimeout).
+	// shutdownGrace bounds how long publishes keep retrying after the
+	// runner ctx is canceled (Options.ShutdownGrace, default
+	// closeFlushTimeout). It is one shutdown-wide budget, not per batch.
 	shutdownGrace time.Duration
+	// graceDeadline is when the shutdown grace ends; zero until the loop
+	// first sees the canceled ctx during a publish. Loop goroutine only.
+	graceDeadline time.Time
 
 	// Now stamps engine_time_unix_nanos (unix nanos). Replaceable in tests.
 	Now func() int64
@@ -216,7 +220,13 @@ func (r *Runner) loop(ctx context.Context) {
 				break drain
 			}
 		}
-		r.flush(ctx, batch, values[:0])
+		if err := r.flush(ctx, batch, values[:0]); errors.Is(err, ErrShuttingDown) {
+			// The batch could not be journaled or published because Stop
+			// ran: everything still queued fails the same way instead of
+			// being journaled after shutdown began.
+			r.drainFail()
+			return
+		}
 	}
 }
 
@@ -241,8 +251,9 @@ func failAll(batch []*request, err error) {
 
 // flush stamps, journals, applies and publishes one batch, then completes
 // its requests. A request is acked only after its command is journaled,
-// applied and its events are published.
-func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) {
+// applied and its events are published. It returns the error the batch
+// failed with (nil on success); ErrShuttingDown tells loop to exit.
+func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) error {
 	r.m.BatchSize.Observe(float64(len(batch)))
 	base := r.eng.LastSeq()
 	for i, q := range batch {
@@ -253,8 +264,9 @@ func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) {
 		b, err := proto.Marshal(q.cmd)
 		if err != nil {
 			// Only a malformed proto can do this; nothing was journaled.
-			failAll(batch, fmt.Errorf("%w: %w", ErrMarshal, err))
-			return
+			err = fmt.Errorf("%w: %w", ErrMarshal, err)
+			failAll(batch, err)
+			return err
 		}
 		values = append(values, b)
 	}
@@ -262,13 +274,14 @@ func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) {
 	if err := r.appendWithRetry(ctx, len(batch), values); err != nil {
 		if errors.Is(err, ErrShuttingDown) {
 			failAll(batch, err)
-			return
+			return err
 		}
 		// Fatal runs before the requests complete so a test hook observes
 		// it deterministically; the default hook exits 3 right here.
 		r.Fatal("wal produce failed; exiting so replay re-establishes the sequence", err)
-		failAll(batch, fmt.Errorf("%w: %w", ErrWALProduce, err))
-		return
+		err = fmt.Errorf("%w: %w", ErrWALProduce, err)
+		failAll(batch, err)
+		return err
 	}
 
 	_, span := r.tracer.Start(ctx, "matcher.engine.apply", trace.WithAttributes(attribute.Int("batch.size", len(batch))))
@@ -292,11 +305,23 @@ func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) {
 		// their events never reached engine.events, so the callers are told
 		// to retry (and learn DUPLICATE_CLIENT_ORDER_ID from the replayed state).
 		failAll(batch, err)
-		return
+		return err
 	}
 	for i, q := range batch {
 		q.done <- outcome{res: results[i]}
 	}
+	return nil
+}
+
+// shutdownDeadline returns the end of the shutdown grace, fixing it on the
+// first call after the runner ctx was canceled so every later batch shares
+// the same budget (Stop returns within about one grace however many
+// batches are queued).
+func (r *Runner) shutdownDeadline() time.Time {
+	if r.graceDeadline.IsZero() {
+		r.graceDeadline = time.Now().Add(r.shutdownGrace)
+	}
+	return r.graceDeadline
 }
 
 // observeLastSeq sets the last_seq{partition} gauge from the engine.
@@ -350,8 +375,9 @@ func (r *Runner) appendWithRetry(ctx context.Context, n int, values [][]byte) er
 
 // publishWithRetry publishes events, retrying forever with exponential
 // backoff (ruling X3: events are derived and at-least-once, never
-// dropped). When ctx ends it keeps retrying for shutdownGrace, then gives
-// up with ErrShuttingDown and logs the unpublished seq range.
+// dropped). When ctx ends it keeps retrying until the shutdown-wide grace
+// deadline (shutdownDeadline), then gives up with ErrShuttingDown and logs
+// the unpublished seq range.
 func (r *Runner) publishWithRetry(ctx context.Context, events []*enginev1.Event) error {
 	if len(events) == 0 {
 		return nil
@@ -386,11 +412,12 @@ func (r *Runner) publishWithRetry(ctx context.Context, events []*enginev1.Event)
 			break
 		}
 	}
-	// Shutdown began while the batch is unpublished: keep trying for the
-	// grace period so a rollout does not lose the last events.
-	gctx, cancel := context.WithTimeout(pctx, r.shutdownGrace)
+	// Shutdown began while the batch is unpublished: keep trying until the
+	// shutdown-wide grace deadline so a rollout does not lose the last events.
+	deadline := r.shutdownDeadline()
+	gctx, cancel := context.WithDeadline(pctx, deadline)
 	defer cancel()
-	r.log.Warn("shutdown with unpublished events; retrying for the grace period", "grace", r.shutdownGrace, "first_seq", first, "last_seq", last)
+	r.log.Warn("shutdown with unpublished events; retrying for the grace period", "grace", r.shutdownGrace, "deadline", deadline, "first_seq", first, "last_seq", last)
 	for ; ; attempt++ {
 		err := r.wal.Publish(gctx, r.partition, keys, values)
 		if err == nil {

@@ -14,9 +14,11 @@ const (
 	// PositionLimit is the maximum shares a user may hold or have on open BUY
 	// orders per outcome.
 	PositionLimit uint64 = 10000
-	// maxOutcomes bounds the fixed-size per-fill maker arrays so matching
-	// does not allocate. CreateMarket with more labels is ignored.
-	maxOutcomes = 8
+	// MaxOutcomes is the most outcomes a market may have; it sizes the
+	// fixed per-fill maker arrays so matching does not allocate. The engine
+	// refuses a CreateMarket with fewer than 2 or more than MaxOutcomes
+	// labels: no market and no event (the journaled command is a no-op).
+	MaxOutcomes = 8
 )
 
 // order is a resting order. It is allocated only when an order actually

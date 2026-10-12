@@ -68,7 +68,7 @@ func (e *Engine) Apply(cmd *enginev1.Command) []*enginev1.Event {
 func (e *Engine) createMarket(c *enginev1.CreateMarket) {
 	id := c.GetMarketId()
 	n := len(c.GetOutcomeLabels())
-	if id == "" || n < 2 || n > maxOutcomes {
+	if id == "" || n < 2 || n > MaxOutcomes {
 		return
 	}
 	if _, exists := e.markets[id]; exists {

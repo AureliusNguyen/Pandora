@@ -164,17 +164,25 @@ func TestSubmitErrorCodes(t *testing.T) {
 	if w.AppendCount() != 1 || len(w.Records[0]) != 1 {
 		t.Fatalf("invalid requests were journaled: appends=%d records=%d", w.AppendCount(), len(w.Records[0]))
 	}
-	// 64-char ids and a lowercase ULID are accepted.
+	// 64-char ids and a lowercase ULID are accepted; the ULID is stored in
+	// its canonical uppercase form.
 	long := mod(func(o *enginev1.SubmitOrder) {
 		o.UserId = strings.Repeat("u", 64)
 		o.ClientOrderId = strings.Repeat("c", 64)
 		o.OrderId = strings.ToLower(validULID)
 	})
-	if r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: long})); err != nil || r.Msg.OrderId != strings.ToLower(validULID) {
-		t.Fatalf("64-char ids must be accepted: %+v err=%v", r, err)
+	if r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: long})); err != nil || r.Msg.OrderId != validULID {
+		t.Fatalf("64-char ids must be accepted with the ULID uppercased: %+v err=%v", r, err)
+	}
+	// A cancel with the lowercase id matches the canonical resting order.
+	cr, err := c.CancelOrder(ctx, connect.NewRequest(&matcherv1.CancelOrderRequest{Cancel: &enginev1.CancelOrder{
+		OrderId: strings.ToLower(validULID), MarketId: DemoMarketID, UserId: strings.Repeat("u", 64),
+	}}))
+	if err != nil || !cr.Msg.Canceled || cr.Msg.CanceledQty != 1 {
+		t.Fatalf("lowercase cancel must match: %+v err=%v", cr, err)
 	}
 	svc.Stop()
-	_, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 50, 1)}))
+	_, err = c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 50, 1)}))
 	if code(err) != connect.CodeUnavailable {
 		t.Fatalf("stopped service must be Unavailable, got %v", err)
 	}
@@ -202,7 +210,7 @@ func TestRunnerErrorMapping(t *testing.T) {
 }
 
 func TestCancelGetBookAndAdmin(t *testing.T) {
-	c, svc, _ := newClientT(t)
+	c, svc, w := newClientT(t)
 	ctx := context.Background()
 	r, err := c.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 33, 7)}))
 	if err != nil {
@@ -256,6 +264,7 @@ func TestCancelGetBookAndAdmin(t *testing.T) {
 	if err != nil || ar.Msg.Seq != 6 {
 		t.Fatalf("create: %+v err=%v", ar.Msg, err)
 	}
+	records := len(w.Records[0])
 	for name, cm := range map[string]*enginev1.CreateMarket{
 		"one label":         {MarketId: "bad", OutcomeLabels: []string{"A"}},
 		"empty label":       {MarketId: "bad", OutcomeLabels: []string{"A", ""}},
@@ -269,6 +278,17 @@ func TestCancelGetBookAndAdmin(t *testing.T) {
 	}
 	if !svc.Runner().HasMarket("mkt_two") || svc.Runner().HasMarket("bad") {
 		t.Fatal("rejected create_market reached the engine")
+	}
+	if got := len(w.Records[0]); got != records {
+		t.Fatalf("rejected create_market was journaled: records %d -> %d", records, got)
+	}
+	for _, win := range []uint32{2, 7} {
+		if _, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_ResolveMarket{ResolveMarket: &enginev1.ResolveMarket{MarketId: DemoMarketID, WinningOutcome: win}}})); code(err) != connect.CodeInvalidArgument {
+			t.Fatalf("resolve with winning_outcome %d: %v", win, err)
+		}
+	}
+	if got := len(w.Records[0]); got != records {
+		t.Fatalf("out-of-range resolve was journaled: records %d -> %d", records, got)
 	}
 	if _, err := c.AdminCommand(ctx, connect.NewRequest(&matcherv1.AdminCommandRequest{Body: &matcherv1.AdminCommandRequest_LockMarket{LockMarket: &enginev1.LockMarket{MarketId: "ghost"}}})); code(err) != connect.CodeNotFound {
 		t.Fatalf("lock ghost: %v", err)

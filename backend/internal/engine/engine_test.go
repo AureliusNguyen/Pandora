@@ -50,7 +50,7 @@ func TestCreateMarketRejectsBadInput(t *testing.T) {
 	cases := []*enginev1.CreateMarket{
 		{MarketId: "", OutcomeLabels: []string{"a", "b"}},
 		{MarketId: "one", OutcomeLabels: []string{"a"}},
-		{MarketId: "many", OutcomeLabels: make([]string, maxOutcomes+1)},
+		{MarketId: "many", OutcomeLabels: make([]string, MaxOutcomes+1)},
 	}
 	for i, c := range cases {
 		if evs := e.Apply(cmdAt(uint64(i+1), c)); len(evs) != 0 {
