@@ -1,0 +1,27 @@
+syntax = "proto3";
+package pandora.common.v1;
+option go_package = "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/common/v1;commonv1";
+
+enum Side { SIDE_UNSPECIFIED = 0; SIDE_BUY = 1; SIDE_SELL = 2; }
+enum TimeInForce { TIME_IN_FORCE_UNSPECIFIED = 0; TIME_IN_FORCE_GTC = 1; TIME_IN_FORCE_IOC = 2; TIME_IN_FORCE_FOK = 3; }
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0; ORDER_STATUS_ACCEPTED = 1; ORDER_STATUS_PARTIALLY_FILLED = 2;
+  ORDER_STATUS_FILLED = 3; ORDER_STATUS_CANCELED = 4; ORDER_STATUS_REJECTED = 5;
+}
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0; REJECT_REASON_MARKET_NOT_FOUND = 1; REJECT_REASON_MARKET_LOCKED = 2;
+  REJECT_REASON_DUPLICATE_CLIENT_ORDER_ID = 3; REJECT_REASON_INSUFFICIENT_SHARES = 4;
+  REJECT_REASON_FOK_UNFILLABLE = 5; REJECT_REASON_POST_ONLY_WOULD_CROSS = 6; REJECT_REASON_INVALID = 7;
+  REJECT_REASON_POSITION_LIMIT = 8; REJECT_REASON_SELF_TRADE = 9;
+}
+enum MarketStatus { MARKET_STATUS_UNSPECIFIED = 0; MARKET_STATUS_OPEN = 1; MARKET_STATUS_LOCKED = 2; MARKET_STATUS_RESOLVED = 3; MARKET_STATUS_VOIDED = 4; }
+
+// A price level in a book. price is integer cents 1..99, qty is shares.
+message Level { uint32 outcome = 1; Side side = 2; uint32 price = 3; uint64 qty = 4; }
+
+// One leg of a fill. For TRANSFER fills there are exactly two legs (buyer, seller).
+// For MINT fills there is one leg per outcome, every leg is a BUY, and the leg
+// prices sum to exactly 100.
+message FillLeg { string order_id = 1; string user_id = 2; uint32 outcome = 3; Side side = 4; uint32 price = 5; bool is_taker = 6; }
+enum FillKind { FILL_KIND_UNSPECIFIED = 0; FILL_KIND_TRANSFER = 1; FILL_KIND_MINT = 2; }
+message Fill { string fill_id = 1; string market_id = 2; FillKind kind = 3; uint64 qty = 4; repeated FillLeg legs = 5; }

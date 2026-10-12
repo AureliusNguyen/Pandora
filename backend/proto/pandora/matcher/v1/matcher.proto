@@ -1,0 +1,27 @@
+syntax = "proto3";
+package pandora.matcher.v1;
+import "pandora/common/v1/types.proto";
+import "pandora/engine/v1/wal.proto";
+option go_package = "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/matcher/v1;matcherv1";
+
+service MatcherService {
+  rpc SubmitOrder(SubmitOrderRequest) returns (SubmitOrderResponse);
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+  rpc GetBook(GetBookRequest) returns (GetBookResponse);
+  rpc AdminCommand(AdminCommandRequest) returns (AdminCommandResponse);
+}
+message SubmitOrderRequest { pandora.engine.v1.SubmitOrder order = 1; }  // order_id empty: matcher assigns ULID
+message SubmitOrderResponse {
+  string order_id = 1; uint64 seq = 2; pandora.common.v1.OrderStatus status = 3;
+  pandora.common.v1.RejectReason reject_reason = 4; repeated pandora.common.v1.Fill fills = 5;
+  int64 engine_time_unix_nanos = 6;
+}
+message CancelOrderRequest { pandora.engine.v1.CancelOrder cancel = 1; }
+message CancelOrderResponse { uint64 seq = 1; bool canceled = 2; uint64 canceled_qty = 3; }
+message GetBookRequest { string market_id = 1; }
+message GetBookResponse { string market_id = 1; uint64 market_seq = 2; pandora.common.v1.MarketStatus status = 3; repeated pandora.common.v1.Level levels = 4; }
+message AdminCommandRequest {
+  oneof body { pandora.engine.v1.CreateMarket create_market = 1; pandora.engine.v1.LockMarket lock_market = 2;
+               pandora.engine.v1.ResolveMarket resolve_market = 3; pandora.engine.v1.VoidMarket void_market = 4; }
+}
+message AdminCommandResponse { uint64 seq = 1; }

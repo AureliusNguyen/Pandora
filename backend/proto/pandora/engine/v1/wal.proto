@@ -1,0 +1,58 @@
+syntax = "proto3";
+package pandora.engine.v1;
+import "pandora/common/v1/types.proto";
+option go_package = "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/engine/v1;enginev1";
+
+message Command {
+  uint64 seq = 1;                 // contiguous per partition, starts at 1
+  uint32 partition = 2;
+  uint64 epoch = 3;               // M1: always 1
+  int64 engine_time_unix_nanos = 4;
+  oneof body {
+    SubmitOrder submit_order = 10;
+    CancelOrder cancel_order = 11;
+    CreateMarket create_market = 12;
+    LockMarket lock_market = 13;
+    ResolveMarket resolve_market = 14;
+    VoidMarket void_market = 15;
+  }
+}
+message SubmitOrder {
+  string order_id = 1; string market_id = 2; string user_id = 3; string client_order_id = 4;
+  uint32 outcome = 5; pandora.common.v1.Side side = 6; uint32 price = 7; uint64 qty = 8;
+  pandora.common.v1.TimeInForce tif = 9; bool post_only = 10;
+}
+message CancelOrder { string order_id = 1; string market_id = 2; string user_id = 3; }
+message CreateMarket { string market_id = 1; string title = 2; repeated string outcome_labels = 3; int64 lock_at_unix_nanos = 4; }
+message LockMarket { string market_id = 1; }
+message ResolveMarket { string market_id = 1; uint32 winning_outcome = 2; }
+message VoidMarket { string market_id = 1; string reason = 2; }
+
+message Event {
+  uint64 seq = 1;                 // command seq that produced it
+  uint32 idx = 2;                 // 0..n within that command; dedup key is (partition, seq, idx)
+  uint32 partition = 3;
+  uint64 epoch = 4;
+  int64 engine_time_unix_nanos = 5;
+  string market_id = 6;
+  uint64 market_seq = 7;          // per-market monotonic, used by fanout book snapshots
+  oneof body {
+    OrderAccepted order_accepted = 10;
+    OrderRejected order_rejected = 11;
+    OrderCanceled order_canceled = 12;
+    pandora.common.v1.Fill fill = 13;
+    LevelUpdate level_update = 14;
+    MarketCreated market_created = 15;
+    MarketLocked market_locked = 16;
+    MarketResolved market_resolved = 17;
+    MarketVoided market_voided = 18;
+  }
+}
+message OrderAccepted { SubmitOrder order = 1; uint64 resting_qty = 2; }   // resting_qty 0 means fully filled or IOC remainder canceled
+message OrderRejected { SubmitOrder order = 1; pandora.common.v1.RejectReason reason = 2; }
+message OrderCanceled { string order_id = 1; string user_id = 2; uint64 canceled_qty = 3; string reason = 4; } // reason: "user", "ioc", "stp", "locked"
+message LevelUpdate { pandora.common.v1.Level level = 1; }               // absolute new qty at that level (0 = removed)
+message MarketCreated { CreateMarket market = 1; }
+message MarketLocked {}
+message MarketResolved { uint32 winning_outcome = 1; }
+message MarketVoided { string reason = 1; }
