@@ -5,7 +5,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/protobuf/proto"
 
@@ -92,4 +95,37 @@ func TestNewProducerBuildsWithoutBroker(t *testing.T) {
 		t.Fatal(err)
 	}
 	cl.Close()
+}
+
+func TestEnsureTopicsIsIdempotent(t *testing.T) {
+	cluster, err := kfake.NewCluster(kfake.NumBrokers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cluster.Close)
+	brokers := cluster.ListenAddrs()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for i := range 2 {
+		if err := kafkax.EnsureTopics(ctx, brokers, kafkax.M1Topics()); err != nil {
+			t.Fatalf("EnsureTopics call %d = %v, want nil", i+1, err)
+		}
+	}
+
+	cl, err := kafkax.NewClient(brokers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	topics, err := kadm.NewClient(cl).ListTopics(ctx, kafkax.TopicEngineWAL, kafkax.TopicEngineEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{kafkax.TopicEngineWAL, kafkax.TopicEngineEvents} {
+		td, ok := topics[name]
+		if !ok || td.Err != nil || len(td.Partitions) != 1 {
+			t.Fatalf("topic %s: present=%v detail=%+v, want 1 partition", name, ok, td)
+		}
+	}
 }

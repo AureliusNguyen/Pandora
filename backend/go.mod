@@ -14,6 +14,7 @@ require (
 	github.com/prometheus/client_golang v1.20.5
 	github.com/twmb/franz-go v1.18.0
 	github.com/twmb/franz-go/pkg/kadm v1.14.0
+	github.com/twmb/franz-go/pkg/kfake v0.0.0-20241015012055-0a9996b613b1
 	go.opentelemetry.io/otel v1.34.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.34.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.56.0

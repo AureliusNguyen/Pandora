@@ -87,7 +87,8 @@ func validateSpecs(specs []TopicSpec) error {
 	return nil
 }
 
-// EnsureTopics creates missing topics; existing topics are left unchanged.
+// EnsureTopics creates missing topics; existing topics are left unchanged
+// (TopicAlreadyExists is success), so it is safe to call on every start.
 func EnsureTopics(ctx context.Context, brokers []string, specs []TopicSpec) error {
 	if err := validateSpecs(specs); err != nil {
 		return err
@@ -101,12 +102,11 @@ func EnsureTopics(ctx context.Context, brokers []string, specs []TopicSpec) erro
 	var errs []error
 	for _, s := range specs {
 		retention := strconv.FormatInt(s.RetentionMs, 10)
-		resp, err := adm.CreateTopic(ctx, s.Partitions, -1, map[string]*string{"retention.ms": &retention}, s.Name)
-		switch {
-		case err != nil:
+		// kadm.CreateTopic returns the per-topic error (resp.Err) as err, so
+		// TopicAlreadyExists must be checked on err itself.
+		_, err := adm.CreateTopic(ctx, s.Partitions, -1, map[string]*string{"retention.ms": &retention}, s.Name)
+		if err != nil && !errors.Is(err, kerr.TopicAlreadyExists) {
 			errs = append(errs, fmt.Errorf("kafkax: create %s: %w", s.Name, err))
-		case resp.Err != nil && !errors.Is(resp.Err, kerr.TopicAlreadyExists):
-			errs = append(errs, fmt.Errorf("kafkax: create %s: %w", s.Name, resp.Err))
 		}
 	}
 	return errors.Join(errs...)
