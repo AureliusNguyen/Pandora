@@ -71,6 +71,7 @@ func run() int {
 		Handler:           gateway.NewServer(client, log).WithAllowedOrigins(cfg.CORSOrigins).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	log.Warn("dev auth enabled: X-User-Id header is trusted as the caller identity; any client can act as any user; not for production (JWT lands in M4)")
 	log.Info("gateway listening", "addr", cfg.HTTPAddr, "matcher", cfg.MatcherAddr, "cors_origins", cfg.CORSOrigins)
 	if err := httpx.Run(ctx, srv, httpx.NewMetricsServer(cfg.MetricsAddr, gatherer, &ready)); err != nil {
 		log.Error("server", "err", err)

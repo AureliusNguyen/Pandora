@@ -26,10 +26,14 @@ func withCORS(origins []string, next http.Handler) http.Handler {
 		allowed[o] = true
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if origin := r.Header.Get("Origin"); allowed[origin] {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			// Responses differ by Origin, allowed or not, so caches must key on it.
+			w.Header().Add("Vary", "Origin")
+		}
+		if allowed[origin] {
 			h := w.Header()
 			h.Set("Access-Control-Allow-Origin", origin)
-			h.Add("Vary", "Origin")
 			h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 			h.Set("Access-Control-Allow-Headers", "Content-Type, X-User-Id, traceparent, tracestate")
 			h.Set("Access-Control-Max-Age", "600")

@@ -73,3 +73,16 @@ func TestRequestMetricLabelsByPattern(t *testing.T) {
 	}
 	t.Fatal("no pandora_gateway_request_seconds sample for the book route")
 }
+
+func TestCORSVaryOnAnyOrigin(t *testing.T) {
+	h := newTestGateway(t, &fakeMatcher{})
+	for _, origin := range []string{"http://localhost:3000", "http://evil.example"} {
+		req := httptest.NewRequest("GET", "/v1/markets", nil)
+		req.Header.Set("Origin", origin)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if !strings.Contains(strings.Join(rec.Header().Values("Vary"), ","), "Origin") {
+			t.Fatalf("%s: Vary = %v", origin, rec.Header().Values("Vary"))
+		}
+	}
+}

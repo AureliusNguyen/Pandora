@@ -1,6 +1,10 @@
-// Package gateway is the public REST edge of Pandora: it authenticates the
-// M1 dev user header, validates order JSON, forwards commands to the matcher
-// over connect-go and maps matcher errors to HTTP status codes.
+// Package gateway is the public REST edge of Pandora: it reads the M1 dev
+// user header, validates order JSON, forwards commands to the matcher over
+// connect-go and maps matcher errors to HTTP status codes.
+//
+// M1 dev auth is NOT authentication: the X-User-Id header is trusted as the
+// caller identity, so any client can impersonate any user by design. It is
+// for local and kind demos only and is replaced by JWT in M4.
 package gateway
 
 import (
@@ -29,6 +33,8 @@ const (
 	// maxUserIDLen bounds the M1 dev-auth header; any non-empty id up to this
 	// length is accepted (the ledger auto-creates unknown users).
 	maxUserIDLen = 64
+	// maxBodyBytes caps the POST /v1/orders body; larger bodies get 413.
+	maxBodyBytes = 1 << 16
 	// statusClientClosed is the nginx-style 499 "client closed request",
 	// used when the caller's context is canceled before the matcher answers.
 	// The contract table has no slot for it; nobody reads the body, but the
@@ -89,28 +95,43 @@ func requireUser(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return user, true
 }
 
-func (s *Server) writeMatcherError(w http.ResponseWriter, err error) {
-	code := http.StatusInternalServerError
+// writeMatcherError maps a failed matcher call to a status and a fixed
+// client message. The error text never reaches the client (it can carry the
+// matcher address or internal detail); it is logged instead.
+func (s *Server) writeMatcherError(w http.ResponseWriter, r *http.Request, err error) {
+	code, msg := http.StatusInternalServerError, "internal error"
 	switch connect.CodeOf(err) {
 	case connect.CodeInvalidArgument:
-		code = http.StatusBadRequest
+		code, msg = http.StatusBadRequest, "invalid order"
 	case connect.CodeNotFound:
-		code = http.StatusNotFound
+		code, msg = http.StatusNotFound, "market not found"
 	case connect.CodeUnavailable, connect.CodeDeadlineExceeded:
-		code = http.StatusServiceUnavailable
+		code, msg = http.StatusServiceUnavailable, "exchange unavailable"
 		w.Header().Set("Retry-After", "1")
 	case connect.CodeCanceled:
-		code = statusClientClosed
+		code, msg = statusClientClosed, "request canceled"
 	}
-	msg := err.Error()
-	var ce *connect.Error
-	if errors.As(err, &ce) && ce.Message() != "" {
-		msg = ce.Message()
-	}
+	level := slog.LevelWarn
 	if code == http.StatusInternalServerError {
-		s.log.Error("matcher call failed", "err", err)
+		level = slog.LevelError
 	}
+	s.log.Log(r.Context(), level, "matcher call failed", "method", r.Method, "path", r.URL.Path, "status", code, "err", err)
 	writeError(w, code, msg)
+}
+
+// writeDecodeError reports a body decode failure without echoing Go type
+// names: 413 for an oversized body, else 400 with at most the field name.
+func writeDecodeError(w http.ResponseWriter, err error) {
+	if errors.As(err, new(*http.MaxBytesError)) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	msg := "invalid JSON body"
+	var te *json.UnmarshalTypeError
+	if errors.As(err, &te) && te.Field != "" {
+		msg += ": field " + te.Field
+	}
+	writeError(w, http.StatusBadRequest, msg)
 }
 
 func (s *Server) submitOrder(w http.ResponseWriter, r *http.Request) {
@@ -119,8 +140,8 @@ func (s *Server) submitOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req OrderRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -131,7 +152,7 @@ func (s *Server) submitOrder(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	resp, err := s.matcher.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: req.Proto(user)}))
 	if err != nil {
-		s.writeMatcherError(w, err)
+		s.writeMatcherError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toOrderResponse(resp.Msg))
@@ -153,7 +174,7 @@ func (s *Server) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		Cancel: &enginev1.CancelOrder{OrderId: r.PathValue("order_id"), MarketId: market, UserId: user},
 	}))
 	if err != nil {
-		s.writeMatcherError(w, err)
+		s.writeMatcherError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, CancelResponse{Seq: resp.Msg.GetSeq(), Canceled: resp.Msg.GetCanceled(), CanceledQty: resp.Msg.GetCanceledQty()})
@@ -172,7 +193,7 @@ func (s *Server) book(ctx context.Context, market string) (*matcherv1.GetBookRes
 func (s *Server) getBook(w http.ResponseWriter, r *http.Request) {
 	b, err := s.book(r.Context(), r.PathValue("market_id"))
 	if err != nil {
-		s.writeMatcherError(w, err)
+		s.writeMatcherError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toBookResponse(b))
@@ -181,7 +202,7 @@ func (s *Server) getBook(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listMarkets(w http.ResponseWriter, r *http.Request) {
 	b, err := s.book(r.Context(), DemoMarketID)
 	if err != nil {
-		s.writeMatcherError(w, err)
+		s.writeMatcherError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, []MarketJSON{{ID: DemoMarketID, Title: demoTitle, Status: marketStatus(b.GetStatus()), Outcomes: []string{"YES", "NO"}}})

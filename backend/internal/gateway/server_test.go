@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -130,13 +131,69 @@ func TestSubmitOrderValidation(t *testing.T) {
 }
 
 func TestMatcherErrorMapping(t *testing.T) {
-	for code, want := range map[connect.Code]int{
-		connect.CodeInvalidArgument: 400, connect.CodeNotFound: 404, connect.CodeUnavailable: 503, connect.CodeInternal: 500,
-		connect.CodeDeadlineExceeded: 503, connect.CodeCanceled: statusClientClosed,
+	type want struct {
+		code int
+		body string
+	}
+	for code, w := range map[connect.Code]want{
+		connect.CodeInvalidArgument:  {400, "invalid order"},
+		connect.CodeNotFound:         {404, "market not found"},
+		connect.CodeUnavailable:      {503, "exchange unavailable"},
+		connect.CodeInternal:         {500, "internal error"},
+		connect.CodeDeadlineExceeded: {503, "exchange unavailable"},
+		connect.CodeCanceled:         {statusClientClosed, "request canceled"},
 	} {
-		rec := do(newTestGateway(t, &fakeMatcher{err: connect.NewError(code, nil)}), "POST", "/v1/orders", "u_alice", validOrder)
-		if rec.Code != want {
-			t.Errorf("%v: got %d want %d", code, rec.Code, want)
+		// The matcher's own message must never reach the client.
+		f := &fakeMatcher{err: connect.NewError(code, errors.New("secret matcher detail 10.0.0.7:9001"))}
+		rec := do(newTestGateway(t, f), "POST", "/v1/orders", "u_alice", validOrder)
+		if rec.Code != w.code || rec.Body.String() != `{"error":"`+w.body+`"}`+"\n" {
+			t.Errorf("%v: got %d %q want %d %q", code, rec.Code, rec.Body, w.code, w.body)
+		}
+	}
+}
+
+func TestDeadMatcherDoesNotLeakAddress(t *testing.T) {
+	client, err := NewMatcherClient("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewServer(client, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	for _, path := range []string{"/v1/markets", "/v1/markets/mkt_demo/book"} {
+		rec := do(h, "GET", path, "", "")
+		body := rec.Body.String()
+		if rec.Code != 503 || strings.Contains(body, "127.0.0.1") || strings.Contains(body, "dial") {
+			t.Fatalf("%s: %d %q", path, rec.Code, body)
+		}
+	}
+	rec := do(h, "POST", "/v1/orders", "u_alice", validOrder)
+	if rec.Code != 503 || rec.Body.String() != `{"error":"exchange unavailable"}`+"\n" {
+		t.Fatalf("submit: %d %q", rec.Code, rec.Body)
+	}
+}
+
+func TestOversizedBody(t *testing.T) {
+	f := &fakeMatcher{}
+	body := `{"client_order_id":"` + strings.Repeat("x", 1<<17) + `"}`
+	rec := do(newTestGateway(t, f), "POST", "/v1/orders", "u_alice", body)
+	if rec.Code != http.StatusRequestEntityTooLarge || rec.Body.String() != `{"error":"request body too large"}`+"\n" {
+		t.Fatalf("oversized: %d %q", rec.Code, rec.Body)
+	}
+	if f.calls.Load() != 0 {
+		t.Fatal("matcher called for oversized body")
+	}
+}
+
+func TestDecodeErrorMessages(t *testing.T) {
+	h := newTestGateway(t, &fakeMatcher{})
+	cases := map[string]string{
+		`{"price":"fifty"}`: "invalid JSON body: field price",
+		`{"qty":1.5}`:       "invalid JSON body: field qty",
+		`{not json`:         "invalid JSON body",
+	}
+	for body, want := range cases {
+		rec := do(h, "POST", "/v1/orders", "u_alice", body)
+		if rec.Code != 400 || rec.Body.String() != `{"error":"`+want+`"}`+"\n" {
+			t.Errorf("%s: %d %q want %q", body, rec.Code, rec.Body, want)
 		}
 	}
 }
