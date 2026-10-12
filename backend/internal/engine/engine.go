@@ -49,6 +49,8 @@ func (e *Engine) Apply(cmd *enginev1.Command) []*enginev1.Event {
 	switch b := cmd.Body.(type) {
 	case *enginev1.Command_CreateMarket:
 		e.createMarket(b.CreateMarket)
+	case *enginev1.Command_SubmitOrder:
+		e.submit(b.SubmitOrder)
 	default:
 		// Unknown or unset body: no-op, LastSeq still advances. Later tasks
 		// add the order and market lifecycle cases.
