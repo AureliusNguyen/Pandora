@@ -215,7 +215,9 @@ func (h *Hub) ApplyCommand(events []*enginev1.Event) {
 		if tail {
 			// A split command's tail keeps the head's market_seq, which
 			// clients would drop as a delta; a snapshot is applied as is.
-			h.broadcastLocked(m, "snapshot", v.Snapshot())
+			snap := v.Snapshot()
+			snap.Trades = delta.Trades // the tail's fills still belong on the tape
+			h.broadcastLocked(m, "snapshot", snap)
 		} else {
 			h.broadcastLocked(m, "delta", delta)
 		}

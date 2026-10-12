@@ -57,19 +57,22 @@ func TestSubscribeSnapshotThenDelta(t *testing.T) {
 
 // The tail of a split command keeps the head's market_seq, so it is broadcast
 // as a full snapshot (applied unconditionally) rather than a delta that
-// clients would drop. A stale command after it is still dropped silently.
+// clients would drop; the tail's fills ride in its trades field. A stale
+// command after it is still dropped silently.
 func TestSplitTailBroadcastsSnapshot(t *testing.T) {
 	h := NewHub()
 	h.LoadSnapshot(snap())
 	c, _ := newTestClient()
 	h.Register(c)
 	h.Subscribe(c, []string{"mkt_demo"})
-	recv(t, c) // snapshot at 42
-	h.ApplyCommand([]*enginev1.Event{mintFill(100, 43, 0), lvl(100, 43, 1, 1, 40, 0)})
+	if m := recv(t, c); m["type"] != "snapshot" || m["trades"] != nil {
+		t.Fatalf("subscribe snapshot = %v, want no trades field", m)
+	}
+	h.ApplyCommand([]*enginev1.Event{lvl(100, 43, 0, 1, 40, 0)})
 	if m := recv(t, c); m["type"] != "delta" || m["market_seq"].(float64) != 43 {
 		t.Fatalf("head = %v", m)
 	}
-	h.ApplyCommand([]*enginev1.Event{lvl(100, 43, 2, 0, 55, 5)})
+	h.ApplyCommand([]*enginev1.Event{mintFill(100, 43, 1), lvl(100, 43, 2, 0, 55, 5)})
 	m := recv(t, c)
 	ls, _ := m["levels"].([]any)
 	if m["type"] != "snapshot" || m["market_seq"].(float64) != 43 || m["status"] != "open" || len(ls) != 1 {
@@ -77,6 +80,14 @@ func TestSplitTailBroadcastsSnapshot(t *testing.T) {
 	}
 	if l := ls[0].(map[string]any); l["outcome"].(float64) != 0 || l["side"] != "BUY" || l["price"].(float64) != 55 || l["qty"].(float64) != 5 {
 		t.Fatalf("tail snapshot level = %v", l)
+	}
+	trs, _ := m["trades"].([]any)
+	if len(trs) != 1 {
+		t.Fatalf("tail snapshot trades = %v, want the tail's one fill", m["trades"])
+	}
+	if tr := trs[0].(map[string]any); tr["fill_id"] != "f1" || tr["kind"] != "MINT" || tr["price"].(float64) != 45 ||
+		tr["qty"].(float64) != 5 || tr["outcome"].(float64) != 1 || tr["taker_side"] != "BUY" {
+		t.Fatalf("tail snapshot trade = %v", tr)
 	}
 	h.ApplyCommand([]*enginev1.Event{lvl(99, 43, 0, 0, 55, 999)})
 	if len(c.Send()) != 0 {

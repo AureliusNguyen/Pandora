@@ -177,8 +177,8 @@ func TestReaderIdleFlushSplitsCommand(t *testing.T) {
 		if m["type"] == "delta" && m["market_seq"].(float64) == 44 {
 			break
 		}
-		if m["type"] != "snapshot" || m["market_seq"].(float64) != 43 {
-			t.Fatalf("tail message = %v, want a snapshot at market_seq 43", m)
+		if m["type"] != "snapshot" || m["market_seq"].(float64) != 43 || m["trades"] != nil {
+			t.Fatalf("tail message = %v, want a snapshot at market_seq 43 (no fills in this tail)", m)
 		}
 		last = m
 	}
