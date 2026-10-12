@@ -7,3 +7,5 @@ require (
 	github.com/oklog/ulid/v2 v2.1.0
 	google.golang.org/protobuf v1.36.5
 )
+
+require github.com/caarlos0/env/v11 v11.3.1
