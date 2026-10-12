@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v2.4.0
+  BUF_VERSION: 1.47.2
+
+jobs:
+  lint-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: backend
+      - name: Validate docker-compose.yml
+        run: docker compose -f docker-compose.yml config --quiet
+
+  lint-proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: bufbuild/buf-action@v1
+        with:
+          version: ${{ env.BUF_VERSION }}
+          setup_only: true
+      - name: Generated code is up to date
+        run: |
+          make proto
+          git diff --exit-code -- backend/gen
+          test -z "$(git status --porcelain -- backend/gen)"
+      - name: Breaking change check
+        if: github.event_name == 'pull_request'
+        working-directory: backend
+        run: |
+          base="origin/${{ github.base_ref }}"
+          if git cat-file -e "$base:backend/buf.yaml" 2>/dev/null; then
+            buf breaking --against "../.git#ref=$base,subdir=backend"
+          else
+            echo "base branch has no buf module yet; skipping breaking check"
+          fi
+
+  test-go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Unit tests (race)
+        working-directory: backend
+        run: go test -race ./...
