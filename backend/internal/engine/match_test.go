@@ -103,10 +103,69 @@ func TestMatchTable(t *testing.T) {
 			{sub("s2", "u_bob", 0, SELL, 71, 5), "rejected(INSUFFICIENT_SHARES)", nil},
 			{sub("s3", "u_bob", 0, SELL, 71, 4), "accepted(4) level(0 SELL 71 4)", nil},
 		}},
+		{"taker sell stp cancels newest and leaves own bid", true, []step{
+			{sub("b1", "u_bob", 0, BUY, 50, 3), "accepted(3) level(0 BUY 50 3)", nil},
+			{sub("s1", "u_bob", 0, SELL, 40, 2), "accepted(0) canceled(stp,2)", []string{"0 BUY 50 3"}},
+			{withTif(sub("s2", "u_bob", 0, SELL, 40, 2), FOK), "rejected(FOK_UNFILLABLE)", []string{"0 BUY 50 3"}},
+			{postOnly(sub("s3", "u_bob", 0, SELL, 40, 2)), "rejected(POST_ONLY_WOULD_CROSS)", []string{"0 BUY 50 3"}},
+		}},
+		{"mint walks two levels in one command", false, []step{
+			{sub("n1", "u_carol", 1, BUY, 45, 5), "accepted(5) level(1 BUY 45 5)", nil},
+			{sub("n2", "u_dave", 1, BUY, 44, 5), "accepted(5) level(1 BUY 44 5)", nil},
+			{sub("y1", "u_alice", 0, BUY, 60, 8), "accepted(0) fill(M5:y1*@55,n1@45) fill(M3:y1*@56,n2@44) level(1 BUY 45 0) level(1 BUY 44 2)", []string{"1 BUY 44 2"}},
+		}},
+		{"three outcome mint legs sum to 100", false, []step{
+			{sub("t0", "u_carol", 0, BUY, 30, 5), "accepted(5) level(0 BUY 30 5)", nil},
+			{sub("t2", "u_dave", 2, BUY, 25, 5), "accepted(5) level(2 BUY 25 5)", nil},
+			{sub("t1", "u_alice", 1, BUY, 45, 5), "accepted(0) fill(M5:t0@30,t1*@45,t2@25) level(0 BUY 30 0) level(2 BUY 25 0)", []string{}},
+		}},
+	}
+	// extras gives a case a non-YES/NO market and/or post-run checks.
+	type extra struct {
+		outcomes []string                      // nil = YES/NO
+		after    func(t *testing.T, e *Engine) // nil = no extra checks
+	}
+	extras := map[string]extra{
+		"taker sell stp cancels newest and leaves own bid": {after: func(t *testing.T, e *Engine) {
+			if e.Position("mkt_demo", "u_bob", 0) != 10 {
+				t.Fatal("stp must not move bob's shares")
+			}
+		}},
+		"mint walks two levels in one command": {after: func(t *testing.T, e *Engine) {
+			if e.Position("mkt_demo", "u_alice", 0) != 8 || e.Position("mkt_demo", "u_carol", 1) != 5 || e.Position("mkt_demo", "u_dave", 1) != 3 {
+				t.Fatal("multi-level mint must credit each leg")
+			}
+		}},
+		"three outcome mint legs sum to 100": {outcomes: []string{"A", "B", "C"}, after: func(t *testing.T, e *Engine) {
+			for _, c := range []struct {
+				user    string
+				outcome uint32
+			}{{"u_carol", 0}, {"u_alice", 1}, {"u_dave", 2}} {
+				if e.Position("mkt_demo", c.user, c.outcome) != 5 {
+					t.Fatalf("%s outcome %d: want 5 shares", c.user, c.outcome)
+				}
+			}
+		}},
+	}
+	for name := range extras {
+		found := false
+		for _, tc := range cases {
+			found = found || tc.name == name
+		}
+		if !found {
+			t.Fatalf("extras key %q matches no case", name)
+		}
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			te := newT(t)
+			x := extras[tc.name]
+			var te *tengine
+			if x.outcomes != nil {
+				te = &tengine{t: t, e: New(0)}
+				te.create("mkt_demo", x.outcomes...)
+			} else {
+				te = newT(t)
+			}
 			if tc.seed {
 				seedMint(t, te, 10)
 			}
@@ -118,6 +177,10 @@ func TestMatchTable(t *testing.T) {
 				if st.book != nil {
 					wantBook(t, te.e, "mkt_demo", st.book...)
 				}
+				checkInvariants(t, te.e)
+			}
+			if x.after != nil {
+				x.after(t, te.e)
 			}
 		})
 	}

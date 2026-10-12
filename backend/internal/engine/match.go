@@ -93,6 +93,7 @@ func (pl *planner) planBuy(m *market, o *enginev1.SubmitOrder) {
 		var mintPrice uint32
 		if mintOK {
 			// taker pays 100 - sum, which must be >= 1 and <= o.Price.
+			// For N > 2, sum >= 100 leaves a crossed cross-outcome book; revisited in M5.
 			if sum >= 100 || o.Price+sum < 100 {
 				mintOK = false
 			} else {
