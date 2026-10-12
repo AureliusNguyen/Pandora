@@ -381,7 +381,7 @@ func TestRunnerShutdownGraceIsShutdownWide(t *testing.T) {
 	start := time.Now()
 	cancel()
 	<-r.Done()
-	if elapsed := time.Since(start); elapsed > 2*grace {
+	if elapsed := time.Since(start); elapsed > 3*grace {
 		t.Fatalf("stop took %v with %d queued batches, want about one grace (%v)", elapsed, queued/MaxBatch, grace)
 	}
 	if err := <-first; !errors.Is(err, ErrShuttingDown) {

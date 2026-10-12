@@ -7,6 +7,12 @@
 // --partition (0), --market (mkt_demo), --compare MATCHER_URL (e.g.
 // http://localhost:9001), --timeout (5m, bounds the whole run).
 //
+// --compare is only meaningful on a quiesced market: the WAL end offset is
+// snapshotted when replay starts and GetBook runs afterwards, so any command
+// journaled in between makes the live book newer than the replayed one and
+// shows up as a (false) diff, typically "market_seq N != M" with M > N. The
+// chaos test must stop order traffic before running it.
+//
 // Exit codes: 0 book printed (and matches live with --compare), 1 replay
 // and live differ, 2 usage, connect, replay or GetBook error, 3 WAL seq gap.
 package main
@@ -66,7 +72,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	brokers := fs.String("brokers", envOr("KAFKA_BROKERS", "localhost:19092"), "comma-separated Kafka brokers")
 	partition := fs.Uint("partition", 0, "engine.wal partition to replay")
 	market := fs.String("market", matcher.DemoMarketID, "market to print")
-	compare := fs.String("compare", "", "matcher base URL; diff against live GetBook and exit 1 on difference")
+	compare := fs.String("compare", "", "matcher base URL; diff against live GetBook and exit 1 on difference (stop order traffic first: commands journaled after replay starts show up as a diff)")
 	timeout := fs.Duration("timeout", 5*time.Minute, "deadline for the whole run (connect, replay, GetBook)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -139,6 +145,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "DIFF (replay vs live):")
 		for _, d := range diffs {
 			_, _ = fmt.Fprintln(stderr, "  "+d)
+		}
+		if live.Msg.MarketSeq > seq {
+			_, _ = fmt.Fprintln(stderr, "note: the live book is newer than the replay; was order traffic stopped before --compare?")
 		}
 		return exitDiff
 	}

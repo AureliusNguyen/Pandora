@@ -11,7 +11,9 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/redpanda"
+	"github.com/twmb/franz-go/pkg/kadm"
 	"google.golang.org/protobuf/proto"
 
 	commonv1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/common/v1"
@@ -28,10 +30,11 @@ func TestKafkaWALRoundTripAndReplay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	rp, err := redpanda.Run(ctx, "docker.redpanda.com/redpandadata/redpanda:v24.2.7")
+	// Registered before the error check so a failed wait does not leak it.
+	testcontainers.CleanupContainer(t, rp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = rp.Terminate(context.Background()) })
 	broker, err := rp.KafkaSeedBroker(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +47,10 @@ func TestKafkaWALRoundTripAndReplay(t *testing.T) {
 	}
 	log := slog.Default()
 
-	newSvc := func() (*Service, *KafkaWAL) {
+	// Each service gets its own order id prefix: a shared counter restarting
+	// at 1 would reuse an id still resting from the first service and the
+	// engine would reject the order.
+	newSvc := func(idPrefix string) (*Service, *KafkaWAL) {
 		wal, err := NewKafkaWAL(ctx, brokers, log)
 		if err != nil {
 			t.Fatal(err)
@@ -52,7 +58,7 @@ func TestKafkaWALRoundTripAndReplay(t *testing.T) {
 		var n int
 		svc := NewService(Options{
 			Partition: 0, WAL: wal, Metrics: NewMetrics(prometheus.NewRegistry()), Log: log,
-			NewID: func() string { n++; return "it" + strconv.Itoa(n) }, DemoMarket: true,
+			NewID: func() string { n++; return idPrefix + strconv.Itoa(n) }, DemoMarket: true,
 			// Never os.Exit inside go test: a WAL failure fails the test instead.
 			Fatal: func(m string, e error) { t.Errorf("fatal: %s: %v", m, e) },
 		})
@@ -62,7 +68,7 @@ func TestKafkaWALRoundTripAndReplay(t *testing.T) {
 		return svc, wal
 	}
 
-	svc1, wal1 := newSvc()
+	svc1, wal1 := newSvc("first-")
 	users := []string{"u_alice", "u_bob", "u_carol"}
 	for i := 0; i < 200; i++ {
 		o := &enginev1.SubmitOrder{
@@ -93,7 +99,10 @@ func TestKafkaWALRoundTripAndReplay(t *testing.T) {
 	}
 	rwal.Close()
 
-	svc2, wal2 := newSvc()
+	// Replay must not republish events: engine.events' end offset is the
+	// same before and after the second service starts.
+	eventsBefore := eventsEndOffset(ctx, t, brokers)
+	svc2, wal2 := newSvc("second-")
 	defer wal2.Close()
 	defer svc2.Stop()
 	levels2, seq2, status2, _ := svc2.Runner().Book(DemoMarketID)
@@ -105,12 +114,36 @@ func TestKafkaWALRoundTripAndReplay(t *testing.T) {
 			t.Fatalf("level %d differs: %v vs %v", i, levels1[i], levels2[i])
 		}
 	}
-	// The second service must keep sequencing from 202, proving no demo re-create.
+	if after := eventsEndOffset(ctx, t, brokers); after != eventsBefore {
+		t.Fatalf("replay republished events: engine.events end offset %d -> %d", eventsBefore, after)
+	}
+	// The second service must keep sequencing from 202, proving no demo
+	// re-create, and accept the order (a rejection would also advance seq).
 	res, err := svc2.SubmitOrder(ctx, connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: &enginev1.SubmitOrder{
 		MarketId: DemoMarketID, UserId: "u_alice", ClientOrderId: "after-replay", Outcome: 0, Side: commonv1.Side_SIDE_BUY, Price: 5, Qty: 1,
 		Tif: commonv1.TimeInForce_TIME_IN_FORCE_GTC,
 	}}))
-	if err != nil || res.Msg.Seq != 202 {
-		t.Fatalf("post-replay seq: %v err=%v", res, err)
+	if err != nil || res.Msg.Seq != 202 || res.Msg.RejectReason != commonv1.RejectReason_REJECT_REASON_UNSPECIFIED ||
+		res.Msg.Status != commonv1.OrderStatus_ORDER_STATUS_ACCEPTED || res.Msg.OrderId != "second-1" {
+		t.Fatalf("post-replay order: %v err=%v", res, err)
 	}
+}
+
+// eventsEndOffset returns the high watermark of engine.events partition 0.
+func eventsEndOffset(ctx context.Context, t *testing.T, brokers []string) int64 {
+	t.Helper()
+	cl, err := kafkax.NewClient(brokers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ends, err := kadm.NewClient(cl).ListEndOffsets(ctx, TopicEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lo, ok := ends.Lookup(TopicEvents, 0)
+	if !ok || lo.Err != nil {
+		t.Fatalf("engine.events end offset: ok=%v err=%v", ok, lo.Err)
+	}
+	return lo.Offset
 }

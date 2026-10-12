@@ -9,6 +9,12 @@
 // events keep being retried after SIGTERM, as one budget for the whole
 // shutdown.
 //
+// Shutdown worst case (set terminationGracePeriodSeconds above it): the
+// RPC server drains for up to httpx.ShutdownTimeout (10 s), the runner keeps
+// retrying unpublished events for SHUTDOWN_GRACE (10 s), KafkaWAL.Close
+// flushes for up to 10 s and the otel shutdown takes up to 5 s: about 35 s
+// with the defaults.
+//
 // Startup: ensure the topics (15 s bound), connect the WAL, serve the
 // metrics port (/healthz answers the startup probe during replay), replay
 // engine.wal, then mark /readyz ready and serve RPCs.
@@ -179,21 +185,26 @@ func run() int {
 	}
 
 	if err := svc.Start(ctx); err != nil {
+		// Capture whether a signal interrupted Start BEFORE svc.Stop and
+		// stopOps: stopOps calls stop(), which cancels ctx, so checking
+		// ctx.Err() afterwards would report every failure as an interrupt.
+		interrupted := ctx.Err() != nil
 		svc.Stop()
 		if opErr := stopOps(); opErr != nil {
 			log.Error("metrics server", "err", opErr)
 			return exitError
 		}
-		if errors.Is(err, matcher.ErrGap) {
-			log.Error("start", "err", err)
+		switch {
+		case errors.Is(err, matcher.ErrGap):
+			log.Error("start: wal seq gap", "err", err)
 			return exitWAL
-		}
-		if ctx.Err() != nil {
+		case interrupted:
 			log.Info("stopped during replay", "err", err)
 			return exitOK
+		default:
+			log.Error("start", "err", err)
+			return exitError
 		}
-		log.Error("start", "err", err)
-		return exitError
 	}
 
 	otelInterceptor, err := otelconnect.NewInterceptor()
