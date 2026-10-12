@@ -12,7 +12,7 @@ services:
       - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
       - --rpc-addr=redpanda:33145
       - --advertise-rpc-addr=redpanda:33145
-    ports: ["19092:19092", "9644:9644"]
+    ports: ["127.0.0.1:19092:19092", "127.0.0.1:9644:9644"]
     volumes: [redpanda:/var/lib/redpanda/data]
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
@@ -24,7 +24,7 @@ services:
     image: docker.redpanda.com/redpandadata/console:v2.7.2
     environment:
       KAFKA_BROKERS: redpanda:9092
-    ports: ["8085:8080"]
+    ports: ["127.0.0.1:8085:8080"]
     depends_on:
       redpanda:
         condition: service_healthy
@@ -35,7 +35,7 @@ services:
       POSTGRES_USER: pandora
       POSTGRES_PASSWORD: pandora
       POSTGRES_DB: pandora
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes: [postgres:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pandora -d pandora"]
@@ -46,7 +46,7 @@ services:
   redis:
     image: redis:7
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -55,7 +55,7 @@ services:
 
   mongo:
     image: mongo:8
-    ports: ["27017:27017"]
+    ports: ["127.0.0.1:27017:27017"]
     volumes: [mongo:/data/db]
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
