@@ -22,12 +22,16 @@ const (
 
 // WSServer serves the fanout WebSocket protocol on /ws.
 type WSServer struct {
-	hub *Hub
-	log *slog.Logger
+	hub     *Hub
+	log     *slog.Logger
+	origins []string
 }
 
 // NewWSServer returns a server that registers each connection with hub.
-func NewWSServer(hub *Hub, log *slog.Logger) *WSServer { return &WSServer{hub: hub, log: log} }
+// origins is the cross-origin allowlist (WS_ORIGINS) as host[:port] patterns.
+func NewWSServer(hub *Hub, log *slog.Logger, origins []string) *WSServer {
+	return &WSServer{hub: hub, log: log, origins: origins}
+}
 
 // Handler returns the HTTP handler serving GET /ws.
 func (s *WSServer) Handler() http.Handler {
@@ -39,9 +43,9 @@ func (s *WSServer) Handler() http.Handler {
 func (s *WSServer) serveWS(w http.ResponseWriter, r *http.Request) {
 	// The library always allows same-origin requests, and non-browser clients
 	// send no Origin header and pass. Cross-origin browsers are allowed only from
-	// localhost (pnpm dev, the kind NodePort); a deployed hostname needs a config
-	// knob like the gateway's CORS_ORIGINS (future).
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"localhost:*", "127.0.0.1:*"}})
+	// the WS_ORIGINS patterns (default localhost:*,127.0.0.1:* for pnpm dev and
+	// the kind NodePort); a deployed hostname is added there.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: s.origins})
 	if err != nil {
 		s.log.Warn("ws accept", "err", err)
 		return

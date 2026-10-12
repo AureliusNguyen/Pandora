@@ -252,3 +252,34 @@ func TestClientCanceledRequest(t *testing.T) {
 		t.Fatalf("canceled client: code=%d body=%s", rec.Code, rec.Body)
 	}
 }
+
+// Unmatched routes answer with the JSON error shape, not the mux's plain text.
+func TestUnmatchedRoutesReturnJSON(t *testing.T) {
+	h := newTestGateway(t, &fakeMatcher{})
+	cases := []struct {
+		method, path string
+		code         int
+		msg          string
+	}{
+		{"GET", "/v1/nope", http.StatusNotFound, "not found"},
+		{"GET", "/", http.StatusNotFound, "not found"},
+		{"PUT", "/v1/orders", http.StatusMethodNotAllowed, "method not allowed"},
+	}
+	for _, c := range cases {
+		rec := do(h, c.method, c.path, "u_alice", "")
+		var got map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("%s %s: body %q is not JSON: %v", c.method, c.path, rec.Body, err)
+		}
+		if rec.Code != c.code || got["error"] != c.msg || rec.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("%s %s: code=%d ct=%q body=%v", c.method, c.path, rec.Code, rec.Header().Get("Content-Type"), got)
+		}
+	}
+	if allow := do(h, "PUT", "/v1/orders", "u_alice", "").Header().Get("Allow"); !strings.Contains(allow, "POST") {
+		t.Fatalf("405 Allow header = %q", allow)
+	}
+	// A matched route's own 404 (unknown market) is untouched.
+	if rec := do(h, "GET", "/v1/markets/mkt_nope/book", "u_alice", ""); rec.Code != http.StatusNotFound || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("matched 404: code=%d body=%s", rec.Code, rec.Body)
+	}
+}

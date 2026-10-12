@@ -18,7 +18,7 @@ import (
 func TestWebSocketRoundTrip(t *testing.T) {
 	hub := NewHub()
 	hub.LoadSnapshot(snap())
-	ts := httptest.NewServer(NewWSServer(hub, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	ts := httptest.NewServer(NewWSServer(hub, slog.New(slog.NewTextHandler(io.Discard, nil)), []string{"localhost:*", "127.0.0.1:*"}).Handler())
 	defer ts.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

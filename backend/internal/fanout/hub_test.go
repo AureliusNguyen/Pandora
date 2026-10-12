@@ -55,6 +55,35 @@ func TestSubscribeSnapshotThenDelta(t *testing.T) {
 	}
 }
 
+// The tail of a split command keeps the head's market_seq, so it is broadcast
+// as a full snapshot (applied unconditionally) rather than a delta that
+// clients would drop. A stale command after it is still dropped silently.
+func TestSplitTailBroadcastsSnapshot(t *testing.T) {
+	h := NewHub()
+	h.LoadSnapshot(snap())
+	c, _ := newTestClient()
+	h.Register(c)
+	h.Subscribe(c, []string{"mkt_demo"})
+	recv(t, c) // snapshot at 42
+	h.ApplyCommand([]*enginev1.Event{mintFill(100, 43, 0), lvl(100, 43, 1, 1, 40, 0)})
+	if m := recv(t, c); m["type"] != "delta" || m["market_seq"].(float64) != 43 {
+		t.Fatalf("head = %v", m)
+	}
+	h.ApplyCommand([]*enginev1.Event{lvl(100, 43, 2, 0, 55, 5)})
+	m := recv(t, c)
+	ls, _ := m["levels"].([]any)
+	if m["type"] != "snapshot" || m["market_seq"].(float64) != 43 || m["status"] != "open" || len(ls) != 1 {
+		t.Fatalf("tail = %v, want a snapshot at 43 with one level", m)
+	}
+	if l := ls[0].(map[string]any); l["outcome"].(float64) != 0 || l["side"] != "BUY" || l["price"].(float64) != 55 || l["qty"].(float64) != 5 {
+		t.Fatalf("tail snapshot level = %v", l)
+	}
+	h.ApplyCommand([]*enginev1.Event{lvl(99, 43, 0, 0, 55, 999)})
+	if len(c.Send()) != 0 {
+		t.Fatal("stale command after a tail must not be broadcast")
+	}
+}
+
 func TestOverflowEvictsOnlySlowClient(t *testing.T) {
 	h := NewHub()
 	h.LoadSnapshot(snap())

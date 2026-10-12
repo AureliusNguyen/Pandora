@@ -215,11 +215,57 @@ func (s *Server) WithAllowedOrigins(origins []string) *Server {
 	return s
 }
 
-// Handler is otelhttp -> CORS -> observe -> mux.
+// Handler is otelhttp -> CORS -> observe -> JSON fallback -> mux.
 func (s *Server) Handler() http.Handler {
 	origins := s.origins
 	if len(origins) == 0 {
 		origins = DefaultAllowedOrigins
 	}
-	return otelhttp.NewHandler(withCORS(origins, observe(s.log, s.Routes())), "gateway")
+	return otelhttp.NewHandler(withCORS(origins, observe(s.log, withJSONFallback(s.Routes()))), "gateway")
 }
+
+// withJSONFallback answers requests that match no route with a JSON error
+// body: 404 {"error":"not found"} or 405 {"error":"method not allowed"} (the
+// mux's Allow header is kept). Matched routes are served untouched. It passes
+// the same *http.Request to the mux, so observe still sees r.Pattern.
+func withJSONFallback(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, pattern := mux.Handler(r); pattern != "" {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(&fallbackWriter{ResponseWriter: w}, r)
+	})
+}
+
+// fallbackWriter replaces the mux's plain-text 404 and 405 with JSON errors
+// and discards the plain-text body that follows.
+type fallbackWriter struct {
+	http.ResponseWriter
+	replaced bool
+}
+
+// WriteHeader writes the JSON error for 404 and 405 and forwards other codes.
+func (f *fallbackWriter) WriteHeader(code int) {
+	switch code {
+	case http.StatusNotFound:
+		f.replaced = true
+		writeError(f.ResponseWriter, code, "not found")
+	case http.StatusMethodNotAllowed:
+		f.replaced = true
+		writeError(f.ResponseWriter, code, "method not allowed")
+	default:
+		f.ResponseWriter.WriteHeader(code)
+	}
+}
+
+// Write drops the mux's body once a JSON error was written.
+func (f *fallbackWriter) Write(b []byte) (int, error) {
+	if f.replaced {
+		return len(b), nil
+	}
+	return f.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (f *fallbackWriter) Unwrap() http.ResponseWriter { return f.ResponseWriter }

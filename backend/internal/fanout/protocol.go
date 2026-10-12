@@ -36,7 +36,10 @@ type TradeJSON struct {
 	TS        string `json:"ts"`
 }
 
-// SnapshotMsg is the full book sent on subscribe.
+// SnapshotMsg is the full book, sent on subscribe and broadcast in place of
+// the delta for the tail of a command split by the reader's idle flush (the
+// tail carries the head's market_seq). Clients apply snapshots
+// unconditionally, replacing their book and market_seq.
 type SnapshotMsg struct {
 	Type      string      `json:"type"`
 	MarketID  string      `json:"market_id"`
@@ -45,10 +48,10 @@ type SnapshotMsg struct {
 	Levels    []LevelJSON `json:"levels"`
 }
 
-// DeltaMsg carries the levels touched and trades made by one command. A
-// command split by the reader's idle flush yields a second delta with the
-// same MarketSeq; clients drop deltas whose market_seq is strictly less than
-// their current one (equal is idempotent because levels carry absolute qty).
+// DeltaMsg carries the levels touched and trades made by one command. Each
+// delta has a market_seq newer than the previous message for the market;
+// clients drop deltas whose market_seq is <= their current one and apply
+// snapshots unconditionally.
 type DeltaMsg struct {
 	Type      string      `json:"type"`
 	MarketID  string      `json:"market_id"`

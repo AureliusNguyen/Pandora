@@ -45,8 +45,8 @@ func TestSnapshotSortedAndComplete(t *testing.T) {
 
 func TestApplyDeltaThenDropStale(t *testing.T) {
 	b := NewBookView(snap())
-	d, mm, ok := b.Apply([]*enginev1.Event{mintFill(100, 43, 0), lvl(100, 43, 1, 1, 40, 0), lvl(100, 43, 2, 0, 55, 5)})
-	if !ok || mm != nil || d.MarketSeq != 43 || len(d.Levels) != 2 || len(d.Trades) != 1 {
+	d, mm, tail, ok := b.Apply([]*enginev1.Event{mintFill(100, 43, 0), lvl(100, 43, 1, 1, 40, 0), lvl(100, 43, 2, 0, 55, 5)})
+	if !ok || tail || mm != nil || d.MarketSeq != 43 || len(d.Levels) != 2 || len(d.Trades) != 1 {
 		t.Fatalf("delta = %+v ok=%v", d, ok)
 	}
 	if tr := d.Trades[0]; tr.Price != 45 || tr.Outcome != 1 || tr.TakerSide != "BUY" || tr.Kind != "MINT" || tr.TS != "2023-11-14T22:13:20Z" {
@@ -56,26 +56,25 @@ func TestApplyDeltaThenDropStale(t *testing.T) {
 	if len(s.Levels) != 1 || s.Levels[0].Qty != 5 || s.MarketSeq != 43 {
 		t.Fatalf("after delta snapshot = %+v", s)
 	}
-	if _, _, ok := b.Apply([]*enginev1.Event{lvl(99, 43, 0, 0, 55, 999)}); ok {
+	if _, _, _, ok := b.Apply([]*enginev1.Event{lvl(99, 43, 0, 0, 55, 999)}); ok {
 		t.Fatal("market_seq == current must be dropped")
 	}
-	if _, _, ok := b.Apply([]*enginev1.Event{lvl(98, 41, 0, 0, 55, 999)}); ok || b.Snapshot().Levels[0].Qty != 5 {
+	if _, _, _, ok := b.Apply([]*enginev1.Event{lvl(98, 41, 0, 0, 55, 999)}); ok || b.Snapshot().Levels[0].Qty != 5 {
 		t.Fatal("older market_seq must be dropped without mutation")
 	}
 }
 
 // A command split by the reader's idle flush arrives as two Apply calls with
 // the same (partition, seq) and market_seq. The tail must be applied (not
-// dropped as stale) and yields a second delta with the same market_seq.
+// dropped as stale) and is flagged so the hub sends a snapshot instead.
 func TestApplySplitCommandTail(t *testing.T) {
 	b := NewBookView(snap())
 	before := testutil.ToFloat64(splitTails)
-	if _, _, ok := b.Apply([]*enginev1.Event{mintFill(100, 43, 0), lvl(100, 43, 1, 1, 40, 0)}); !ok {
-		t.Fatal("head of the command must apply")
+	if _, _, tail, ok := b.Apply([]*enginev1.Event{mintFill(100, 43, 0), lvl(100, 43, 1, 1, 40, 0)}); !ok || tail {
+		t.Fatalf("head of the command must apply as a non-tail: ok=%v tail=%v", ok, tail)
 	}
-	d, _, ok := b.Apply([]*enginev1.Event{lvl(100, 43, 2, 0, 55, 5)})
-	if !ok || d.MarketSeq != 43 || len(d.Levels) != 1 || d.Levels[0].Qty != 5 {
-		t.Fatalf("tail delta = %+v ok=%v", d, ok)
+	if _, _, tail, ok := b.Apply([]*enginev1.Event{lvl(100, 43, 2, 0, 55, 5)}); !ok || !tail {
+		t.Fatalf("tail must apply and be flagged: ok=%v tail=%v", ok, tail)
 	}
 	if s := b.Snapshot(); len(s.Levels) != 1 || s.Levels[0].Qty != 5 || s.MarketSeq != 43 {
 		t.Fatalf("after tail snapshot = %+v", s)
@@ -86,7 +85,7 @@ func TestApplySplitCommandTail(t *testing.T) {
 	// Same market_seq from another partition is not the same command.
 	other := lvl(100, 43, 3, 0, 55, 999)
 	other.Partition = 1
-	if _, _, ok := b.Apply([]*enginev1.Event{other}); ok {
+	if _, _, _, ok := b.Apply([]*enginev1.Event{other}); ok {
 		t.Fatal("equal market_seq from a different command must be dropped")
 	}
 }
@@ -95,14 +94,14 @@ func TestApplySplitCommandTail(t *testing.T) {
 // equal-seq event replayed after bootstrap is already in the snapshot.
 func TestApplyEqualSeqAfterSnapshotDropped(t *testing.T) {
 	b := NewBookView(snap())
-	if _, _, ok := b.Apply([]*enginev1.Event{lvl(90, 42, 0, 0, 55, 999)}); ok || b.Snapshot().Levels[0].Qty != 10 {
+	if _, _, _, ok := b.Apply([]*enginev1.Event{lvl(90, 42, 0, 0, 55, 999)}); ok || b.Snapshot().Levels[0].Qty != 10 {
 		t.Fatal("event with the snapshot's market_seq must be dropped")
 	}
 }
 
 func TestApplyResolvedEmitsMarketMsg(t *testing.T) {
 	b := NewBookView(snap())
-	_, mm, ok := b.Apply([]*enginev1.Event{{
+	_, mm, _, ok := b.Apply([]*enginev1.Event{{
 		Seq: 101, MarketId: "mkt_demo", MarketSeq: 43,
 		Body: &enginev1.Event_MarketResolved{MarketResolved: &enginev1.MarketResolved{WinningOutcome: 1}},
 	}})

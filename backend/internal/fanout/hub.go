@@ -181,7 +181,8 @@ func (h *Hub) broadcastLocked(market, typ string, v any) {
 
 // ApplyCommand takes the events of one engine command (or, after an idle
 // flush split, part of one), splits them by market, updates each view and
-// broadcasts one delta (plus a market message) per market.
+// broadcasts one delta (plus a market message) per market. The tail of a split
+// command is broadcast as a snapshot of the market instead of a delta.
 func (h *Hub) ApplyCommand(events []*enginev1.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -207,11 +208,17 @@ func (h *Hub) ApplyCommand(events []*enginev1.Event) {
 			v = NewEmptyBookView(m)
 			h.views[m] = v
 		}
-		delta, mm, ok := v.Apply(evs)
+		delta, mm, tail, ok := v.Apply(evs)
 		if !ok {
 			continue
 		}
-		h.broadcastLocked(m, "delta", delta)
+		if tail {
+			// A split command's tail keeps the head's market_seq, which
+			// clients would drop as a delta; a snapshot is applied as is.
+			h.broadcastLocked(m, "snapshot", v.Snapshot())
+		} else {
+			h.broadcastLocked(m, "delta", delta)
+		}
 		if mm != nil {
 			h.broadcastLocked(m, "market", mm)
 		}

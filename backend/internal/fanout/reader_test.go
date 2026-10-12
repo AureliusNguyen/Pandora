@@ -140,7 +140,7 @@ func TestBootstrapStopsOnCancel(t *testing.T) {
 }
 
 // The idle flush may release a command before its tail arrives. The tail must
-// still reach the book view and is sent as a second delta with the same
+// still reach the book view and is sent as a snapshot carrying the head's
 // market_seq; the split is counted.
 func TestReaderIdleFlushSplitsCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -170,23 +170,28 @@ func TestReaderIdleFlushSplitsCommand(t *testing.T) {
 	}
 	produce(ctx, t, prod, lvl(100, 43, 1, 1, 40, 0), lvl(100, 43, 2, 0, 55, 5), lvl(101, 44, 0, 0, 54, 2))
 	// The tail may itself arrive in more than one fetch; every piece is a
-	// delta with market_seq 43 and together they carry both levels.
-	var tailLevels []any
+	// snapshot with market_seq 43, and the last one reflects both levels.
+	var last map[string]any
 	for {
-		d := next(ctx, t, c)
-		if d["type"] != "delta" {
-			t.Fatalf("unexpected message %v", d)
-		}
-		if d["market_seq"].(float64) == 44 {
+		m := next(ctx, t, c)
+		if m["type"] == "delta" && m["market_seq"].(float64) == 44 {
 			break
 		}
-		if d["market_seq"].(float64) != 43 || len(d["trades"].([]any)) != 0 {
-			t.Fatalf("tail delta = %v", d)
+		if m["type"] != "snapshot" || m["market_seq"].(float64) != 43 {
+			t.Fatalf("tail message = %v, want a snapshot at market_seq 43", m)
 		}
-		tailLevels = append(tailLevels, d["levels"].([]any)...)
+		last = m
 	}
-	if len(tailLevels) != 2 {
-		t.Fatalf("tail levels = %v, want the two level updates of command 100", tailLevels)
+	if last == nil {
+		t.Fatal("no snapshot was sent for the tail of command 100")
+	}
+	// outcome 1 @40 removed and outcome 0 @55 reduced to 5 by the tail.
+	tailLs := last["levels"].([]any)
+	if len(tailLs) != 1 {
+		t.Fatalf("tail snapshot = %v, want one level", last)
+	}
+	if l := tailLs[0].(map[string]any); l["outcome"].(float64) != 0 || l["price"].(float64) != 55 || l["qty"].(float64) != 5 {
+		t.Fatalf("tail snapshot level = %v", l)
 	}
 	if got := testutil.ToFloat64(splitTails) - before; got < 1 {
 		t.Fatalf("split tails metric diff = %v, want >= 1", got)

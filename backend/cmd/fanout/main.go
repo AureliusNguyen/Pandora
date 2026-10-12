@@ -114,7 +114,14 @@ func run() int {
 		readerErr <- err
 	}()
 
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: fanout.NewWSServer(hub, log).Handler(), ReadHeaderTimeout: 5 * time.Second}
+	// No Read/WriteTimeout: they would cut long-lived WebSocket connections,
+	// whose frames have their own write, ping and read deadlines.
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           fanout.NewWSServer(hub, log, cfg.WSOrigins).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	ready.SetReady(true)
 	log.Info("fanout listening", "addr", cfg.HTTPAddr, "matcher", cfg.MatcherAddr)
 	runErr := httpx.Run(ctx, srv)

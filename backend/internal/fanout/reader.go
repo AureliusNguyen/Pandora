@@ -22,14 +22,14 @@ import (
 const (
 	eventsTopic = kafkax.TopicEngineEvents
 	// idleFlush is how long a held command waits for more of its events
-	// before it is sent; a later tail becomes a second delta (same market_seq).
+	// before it is sent; a later tail is sent as a snapshot of the market.
 	idleFlush = 5 * time.Millisecond
 	// attemptTimeout bounds one bootstrap attempt so retries keep logging.
 	attemptTimeout = 5 * time.Second
 )
 
-var malformed = promauto.NewCounter(prometheus.CounterOpts{
-	Namespace: "pandora", Subsystem: "fanout", Name: "malformed_events_total",
+var decodeErrors = promauto.NewCounter(prometheus.CounterOpts{
+	Namespace: "pandora", Subsystem: "fanout", Name: "decode_errors_total",
 	Help: "engine.events records that could not be decoded and were skipped.",
 })
 
@@ -117,7 +117,7 @@ func NewReader(cl *kgo.Client, hub *Hub, log *slog.Logger) *Reader {
 // Run feeds the hub one whole command at a time. While a command is held, polls
 // use an idleFlush deadline; an empty poll means the command is complete and is
 // flushed. If more of that command arrives later, the BookView still applies it
-// and the hub sends it as a second delta with the same market_seq. Run returns
+// and the hub sends a snapshot of the market instead of a delta. Run returns
 // ctx.Err() when ctx ends.
 func (r *Reader) Run(ctx context.Context) error {
 	var g CommandGrouper
@@ -149,7 +149,7 @@ func (r *Reader) Run(ctx context.Context) error {
 		for _, rec := range recs {
 			ev := &enginev1.Event{}
 			if err := kafkax.Decode(rec, ev); err != nil {
-				malformed.Inc()
+				decodeErrors.Inc()
 				r.log.Error("undecodable event", "partition", rec.Partition, "offset", rec.Offset, "err", err)
 				continue
 			}

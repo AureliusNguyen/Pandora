@@ -14,7 +14,7 @@ import (
 
 var splitTails = promauto.NewCounter(prometheus.CounterOpts{
 	Namespace: "pandora", Subsystem: "fanout", Name: "split_command_tails_total",
-	Help: "Commands whose events reached a book view in more than one batch (idle flush split); each tail is sent as an extra delta with the same market_seq.",
+	Help: "Commands whose events reached a book view in more than one batch (idle flush split); each tail is sent as a full snapshot.",
 })
 
 type levelKey struct {
@@ -97,18 +97,20 @@ func (b *BookView) accept(ev *enginev1.Event) (ok, tail bool) {
 
 // Apply applies a batch of events for this market, normally one whole
 // command. Every event not already reflected in the view is applied in order,
-// so a command split across batches never loses its tail. ok is false when
-// nothing in the batch was newer than the view (stale, dropped untouched).
-func (b *BookView) Apply(events []*enginev1.Event) (*DeltaMsg, *MarketMsg, bool) {
-	var d *DeltaMsg
-	var mm *MarketMsg
-	for i, ev := range events {
-		ok, tail := b.accept(ev)
-		if !ok {
+// so a command split across batches never loses its tail. tail is true when
+// the batch continues the last applied command (same market_seq); the hub
+// then sends a snapshot instead of the delta, because clients drop deltas
+// whose market_seq is not newer than theirs. ok is false when nothing in the
+// batch was newer than the view (stale, dropped untouched).
+func (b *BookView) Apply(events []*enginev1.Event) (d *DeltaMsg, mm *MarketMsg, tail, ok bool) {
+	for _, ev := range events {
+		accepted, isTail := b.accept(ev)
+		if !accepted {
 			continue
 		}
 		if d == nil {
-			if tail && i == 0 {
+			if isTail {
+				tail = true
 				splitTails.Inc()
 			}
 			d = &DeltaMsg{Type: "delta", MarketID: b.marketID, Levels: []LevelJSON{}, Trades: []TradeJSON{}}
@@ -140,5 +142,5 @@ func (b *BookView) Apply(events []*enginev1.Event) (*DeltaMsg, *MarketMsg, bool)
 			mm = &MarketMsg{Type: "market", MarketID: b.marketID, Status: "voided"}
 		}
 	}
-	return d, mm, d != nil
+	return d, mm, tail, d != nil
 }

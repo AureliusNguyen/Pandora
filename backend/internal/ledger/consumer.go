@@ -215,6 +215,9 @@ func (c *Consumer) applyWithRetry(ctx context.Context, envs []Envelope, recs []*
 			applySeconds.Observe(time.Since(start).Seconds())
 			return recs, nil
 		}
+		if ctx.Err() != nil { // shutdown cancelled the apply; not a retry
+			return nil, ctx.Err()
+		}
 		batchRetries.Inc()
 		c.log.Error("apply batch failed, retrying", "offsets", offsetRanges(recs), "err", err, "backoff", backoff)
 		c.cl.AllowRebalance() // let a pending rebalance and its Lost/Revoked callbacks run
