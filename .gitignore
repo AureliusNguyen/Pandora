@@ -1,0 +1,39 @@
+# Local docs (specs, plans, notes)
+docs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Claude Code per-project orientation cache
+.claude/peek-map.json
+.claude/peek-map.json.tmp
+.claude/.peek-sessions
+.claude/.peek.lock
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Build outputs
+bin/
+dist/
+coverage/
+*.out
+
+# Node
+node_modules/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Go
+backend/bin/
+backend/.cache/
+
+# k6 / load artifacts
+backend/load/results/
