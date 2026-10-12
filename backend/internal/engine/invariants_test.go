@@ -12,7 +12,10 @@ import (
 //  2. per position: locked <= qty and qty + openBuy <= PositionLimit;
 //  3. every level's qty == sum of remaining of its FIFO; every resting
 //     order is in the index at its own price; ladder count and best agree;
-//  4. sum(locked) == resting SELL qty and sum(openBuy) == resting BUY qty.
+//  4. sum(locked) == resting SELL qty and sum(openBuy) == resting BUY qty,
+//     and per (user, outcome): locked == that user's resting SELL qty and
+//     openBuy == that user's resting BUY qty; every resting order has a
+//     position.
 func checkInvariants(t testing.TB, e *Engine) {
 	t.Helper()
 	for id, m := range e.markets {
@@ -35,6 +38,8 @@ func checkInvariants(t testing.TB, e *Engine) {
 			}
 		}
 		var restingSell, restingBuy, resting int
+		// reserved[k] is {resting SELL qty, resting BUY qty} per user/outcome.
+		reserved := make(map[posKey][2]uint64)
 		for i := range m.books {
 			for _, lad := range [2]*ladder{&m.books[i].bids, &m.books[i].asks} {
 				var bestSeen uint32
@@ -55,11 +60,16 @@ func checkInvariants(t testing.TB, e *Engine) {
 						sum += o.remaining
 						resting++
 						onLadder++
+						rk := posKey{o.userID, o.outcome}
+						r := reserved[rk]
 						if lad.side == SELL {
 							restingSell += int(o.remaining)
+							r[0] += o.remaining
 						} else {
 							restingBuy += int(o.remaining)
+							r[1] += o.remaining
 						}
+						reserved[rk] = r
 					}
 					if sum != lvl.qty {
 						t.Fatalf("%s: level %d qty %d != sum %d", id, p, lvl.qty, sum)
@@ -81,6 +91,17 @@ func checkInvariants(t testing.TB, e *Engine) {
 		}
 		if uint64(restingSell) != lockedSum || uint64(restingBuy) != openBuySum {
 			t.Fatalf("%s: reservations drift: locked %d vs sell %d, openBuy %d vs buy %d", id, lockedSum, restingSell, openBuySum, restingBuy)
+		}
+		for k, p := range m.positions {
+			r := reserved[k]
+			if p.locked != r[0] || p.openBuy != r[1] {
+				t.Fatalf("%s %v: locked %d vs resting sell %d, openBuy %d vs resting buy %d", id, k, p.locked, r[0], p.openBuy, r[1])
+			}
+		}
+		for k := range reserved {
+			if m.positions[k] == nil {
+				t.Fatalf("%s %v: resting orders without a position", id, k)
+			}
 		}
 		if m.status != commonv1.MarketStatus_MARKET_STATUS_OPEN && len(m.orders) != 0 {
 			t.Fatalf("%s: non-open market still has resting orders", id)

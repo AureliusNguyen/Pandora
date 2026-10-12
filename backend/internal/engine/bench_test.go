@@ -34,7 +34,10 @@ func BenchmarkApplySubmit(b *testing.B) {
 			k := i % ring
 			seq++
 			subs[k].Seq = seq
-			e.Apply(subs[k])
+			evs := e.Apply(subs[k])
+			if i == 0 && evs[0].GetOrderAccepted().GetRestingQty() != 10 {
+				b.Fatalf("first submit did not rest 10: %v", evs[0])
+			}
 			seq++
 			cans[k].Seq = seq
 			e.Apply(cans[k])
@@ -72,8 +75,8 @@ func BenchmarkApplySubmit(b *testing.B) {
 			}
 			seq++
 			buys[k].Seq = seq
-			if evs := e.Apply(buys[k]); evs[0].GetOrderAccepted().GetRestingQty() != 0 {
-				b.Fatal("buy did not fully cross")
+			if evs := e.Apply(buys[k]); evs[0].GetOrderAccepted() == nil || evs[0].GetOrderAccepted().GetRestingQty() != 0 {
+				b.Fatalf("buy did not fully cross: %v", evs[0])
 			}
 		}
 	})
