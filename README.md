@@ -24,7 +24,9 @@ created or lost.
 ## Run locally
 
 Requirements: Go (any version >= 1.21; the 1.25 toolchain is auto-downloaded),
-buf, Docker, pnpm, k6, kind, helm.
+buf, goose (for `make migrate`), Docker with Compose v2 (`docker compose`),
+pnpm, k6, kind, helm. `make test` runs with `-race`, which needs a C compiler
+(cgo); without one, run `make test RACE=`.
 
 ```bash
 make infra-up          # Redpanda, Postgres, Redis, Mongo via docker compose
