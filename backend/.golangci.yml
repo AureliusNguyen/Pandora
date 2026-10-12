@@ -1,0 +1,29 @@
+version: "2"
+run:
+  timeout: 5m
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gocritic
+    - revive
+  exclusions:
+    generated: lax
+    presets:
+      - std-error-handling
+    paths:
+      - gen
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/aureliusnguyen/pandora
+  exclusions:
+    generated: lax
+    paths:
+      - gen
