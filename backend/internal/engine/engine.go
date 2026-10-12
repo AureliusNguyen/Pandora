@@ -51,9 +51,16 @@ func (e *Engine) Apply(cmd *enginev1.Command) []*enginev1.Event {
 		e.createMarket(b.CreateMarket)
 	case *enginev1.Command_SubmitOrder:
 		e.submit(b.SubmitOrder)
+	case *enginev1.Command_CancelOrder:
+		e.cancel(b.CancelOrder)
+	case *enginev1.Command_LockMarket:
+		e.lock(b.LockMarket.GetMarketId())
+	case *enginev1.Command_ResolveMarket:
+		e.resolve(b.ResolveMarket)
+	case *enginev1.Command_VoidMarket:
+		e.void(b.VoidMarket)
 	default:
-		// Unknown or unset body: no-op, LastSeq still advances. Later tasks
-		// add the order and market lifecycle cases.
+		// Unknown or unset body: no-op, LastSeq still advances.
 	}
 	return e.em.finish()
 }
