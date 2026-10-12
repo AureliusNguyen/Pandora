@@ -21,6 +21,7 @@ type FakeWAL struct {
 	Events      []FakeEvent
 	Appends     int
 	FailAppend  error // when non-nil, Append stores nothing and returns it
+	batchSizes  []int // record count of every Append call, failed ones included
 	publishes   int
 	failPublish error
 }
@@ -33,6 +34,7 @@ func (w *FakeWAL) Append(_ context.Context, partition uint32, values [][]byte) e
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.Appends++
+	w.batchSizes = append(w.batchSizes, len(values))
 	if w.FailAppend != nil {
 		return w.FailAppend
 	}
@@ -96,4 +98,19 @@ func (w *FakeWAL) SetFailPublish(err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.failPublish = err
+}
+
+// AppendCount returns how many Append calls were made, failed ones
+// included; race-free for reads concurrent with the runner.
+func (w *FakeWAL) AppendCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Appends
+}
+
+// BatchSizes returns the record count of every Append call in order.
+func (w *FakeWAL) BatchSizes() []int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]int(nil), w.batchSizes...)
 }
