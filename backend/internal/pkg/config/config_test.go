@@ -75,6 +75,23 @@ func TestOverrides(t *testing.T) {
 	}
 }
 
+func TestListsAreTrimmed(t *testing.T) {
+	m, err := config.LoadFrom[config.Matcher](map[string]string{"KAFKA_BROKERS": "k1:9092, k2:9092,"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(m.Brokers, []string{"k1:9092", "k2:9092"}) {
+		t.Fatalf("KAFKA_BROKERS not normalized: %q", m.Brokers)
+	}
+	g, err := config.LoadFrom[config.Gateway](map[string]string{"CORS_ORIGINS": " http://a.test ,http://b.test, "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(g.CORSOrigins, []string{"http://a.test", "http://b.test"}) {
+		t.Fatalf("CORS_ORIGINS not normalized: %q", g.CORSOrigins)
+	}
+}
+
 func TestInvalidValueIsError(t *testing.T) {
 	if _, err := config.LoadFrom[config.Matcher](map[string]string{"DEMO_MARKET": "notabool"}); err == nil {
 		t.Fatal("want error for DEMO_MARKET=notabool")

@@ -14,7 +14,7 @@ linters:
     presets:
       - std-error-handling
     paths:
-      - gen
+      - ^gen/
 formatters:
   enable:
     - gofumpt
@@ -26,4 +26,4 @@ formatters:
   exclusions:
     generated: lax
     paths:
-      - gen
+      - ^gen/

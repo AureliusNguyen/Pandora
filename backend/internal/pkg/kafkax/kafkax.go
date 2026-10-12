@@ -67,11 +67,14 @@ func NewClient(brokers []string, opts ...kgo.Opt) (*kgo.Client, error) {
 
 // NewProducer builds a client with acks=all and 1 ms linger. franz-go
 // enables the idempotent producer by default with acks=all; never pass
-// kgo.DisableIdempotentWrite.
+// kgo.DisableIdempotentWrite. Record delivery is bounded at 10 s so a
+// produce against an unreachable broker fails instead of hanging; callers
+// may override it via opts (e.g. kgo.RecordDeliveryTimeout).
 func NewProducer(brokers []string, opts ...kgo.Opt) (*kgo.Client, error) {
 	base := []kgo.Opt{
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.ProducerLinger(time.Millisecond),
+		kgo.RecordDeliveryTimeout(10 * time.Second),
 	}
 	return NewClient(brokers, append(base, opts...)...)
 }

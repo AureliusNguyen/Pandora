@@ -97,6 +97,26 @@ func TestNewProducerBuildsWithoutBroker(t *testing.T) {
 	cl.Close()
 }
 
+func TestNewProducerBoundsDelivery(t *testing.T) {
+	cl, err := kafkax.NewProducer([]string{"127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = cl.ProduceSync(ctx, &kgo.Record{Topic: "t", Value: []byte("x")}).FirstErr()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("want delivery error against a dead broker")
+	}
+	if elapsed >= 14*time.Second {
+		t.Fatalf("delivery not bounded: took %v (err %v)", elapsed, err)
+	}
+	t.Logf("produce failed after %v: %v", elapsed, err)
+}
+
 func TestEnsureTopicsIsIdempotent(t *testing.T) {
 	cluster, err := kfake.NewCluster(kfake.NumBrokers(1))
 	if err != nil {

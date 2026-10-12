@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -23,6 +24,10 @@ type Kafka struct {
 	Brokers []string `env:"KAFKA_BROKERS" envDefault:"localhost:19092" envSeparator:","`
 }
 
+// normalize trims each broker and drops empty entries. Matcher, Ledger and
+// Fanout embed Kafka, so the promoted method covers them too.
+func (k *Kafka) normalize() { k.Brokers = cleanList(k.Brokers) }
+
 // Gateway is the REST edge configuration. CORSOrigins is the browser
 // origin allowlist (local `pnpm dev` on :3000, the kind web NodePort :30300).
 type Gateway struct {
@@ -30,6 +35,21 @@ type Gateway struct {
 	HTTPAddr    string   `env:"HTTP_ADDR" envDefault:":8080"`
 	MatcherAddr string   `env:"MATCHER_ADDR" envDefault:"http://localhost:9001"`
 	CORSOrigins []string `env:"CORS_ORIGINS" envDefault:"http://localhost:3000,http://localhost:30300" envSeparator:","`
+}
+
+// normalize trims each CORS origin and drops empty entries. Gateway does not
+// embed Kafka; if it ever does, this must also call g.Kafka.normalize().
+func (g *Gateway) normalize() { g.CORSOrigins = cleanList(g.CORSOrigins) }
+
+// cleanList trims each entry of a comma-split env list and drops empties.
+func cleanList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // Matcher is the sequencer + engine configuration.
@@ -63,6 +83,9 @@ func Load[T any]() (T, error) {
 	if err := env.Parse(&cfg); err != nil {
 		return cfg, fmt.Errorf("config: %w", err)
 	}
+	if n, ok := any(&cfg).(interface{ normalize() }); ok {
+		n.normalize()
+	}
 	return cfg, nil
 }
 
@@ -71,6 +94,9 @@ func LoadFrom[T any](environ map[string]string) (T, error) {
 	var cfg T
 	if err := env.ParseWithOptions(&cfg, env.Options{Environment: environ}); err != nil {
 		return cfg, fmt.Errorf("config: %w", err)
+	}
+	if n, ok := any(&cfg).(interface{ normalize() }); ok {
+		n.normalize()
 	}
 	return cfg, nil
 }
