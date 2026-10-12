@@ -10,6 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/protobuf/proto"
 
 	enginev1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/engine/v1"
 	"github.com/aureliusnguyen/pandora/backend/internal/engine"
@@ -42,6 +43,7 @@ func newRunnerT(t *testing.T) (*Runner, *FakeWAL, *fatalRec, context.CancelFunc)
 	// Real backoffs are seconds; tests only check the retry counts.
 	r.walBackoff = backoff{base: time.Millisecond, max: time.Millisecond}
 	r.publishBackoff = backoff{base: time.Millisecond, max: time.Millisecond}
+	r.shutdownGrace = 20 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	r.Start(ctx)
 	t.Cleanup(func() { cancel(); <-r.Done() })
@@ -205,6 +207,67 @@ func TestRunnerProduceFailureFailsBatchAndCallsFatal(t *testing.T) {
 	if w.Appends != 1+1+walRetries {
 		t.Fatalf("appends=%d, want the first try plus %d retries", w.Appends, walRetries)
 	}
+	// The failed batch's seqs are reused: the next command is seq 2 in the
+	// response and in the journal, and a replay of the journal yields the
+	// same book as the live engine.
+	w.FailAppend = nil
+	res, err := r.Submit(ctx, &enginev1.Command{Body: submitCmd(0, "b", 41).Body})
+	if err != nil || res.Seq != 2 {
+		t.Fatalf("after recovery: res=%+v err=%v", res, err)
+	}
+	var stored enginev1.Command
+	if len(w.Records[0]) != 2 || protoUnmarshal(w.Records[0][1], &stored) != nil || stored.Seq != 2 {
+		t.Fatalf("journal: records=%d stored seq=%d", len(w.Records[0]), stored.Seq)
+	}
+	fresh := engine.New(0)
+	if n, err := ReplayInto(ctx, w, 0, fresh, slog.Default()); err != nil || n != 2 {
+		t.Fatalf("replay: n=%d err=%v", n, err)
+	}
+	liveLevels, liveSeq, liveStatus, _ := r.Book("mkt_demo")
+	gotLevels, gotSeq, gotStatus, ok := fresh.Book("mkt_demo")
+	if !ok || gotSeq != liveSeq || gotStatus != liveStatus || len(gotLevels) != len(liveLevels) || len(gotLevels) != 1 {
+		t.Fatalf("replayed book differs: seq %d vs %d, levels %d vs %d", gotSeq, liveSeq, len(gotLevels), len(liveLevels))
+	}
+	for i := range gotLevels {
+		if !proto.Equal(gotLevels[i], liveLevels[i]) {
+			t.Fatalf("level %d differs: %v vs %v", i, gotLevels[i], liveLevels[i])
+		}
+	}
+}
+
+func TestRunnerProduceFailureFailsEveryWaiter(t *testing.T) {
+	r, w, fr, _ := newRunnerT(t)
+	ctx := context.Background()
+	// Stall the loop in a publish retry so several requests queue behind it.
+	w.SetFailPublish(errors.New("events down"))
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Submit(ctx, &enginev1.Command{Body: createCmd(0).Body})
+		done <- err
+	}()
+	waitFor(t, "a publish failure", func() bool { return testutil.ToFloat64(r.m.PublishFailures) >= 1 })
+	const n = 5
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			_, err := r.Submit(ctx, &enginev1.Command{Body: submitCmd(0, "o"+itoa(i), 40).Body})
+			errs <- err
+		}(i)
+	}
+	waitFor(t, "the queue to fill", func() bool { return len(r.reqs) == n })
+	w.FailAppend = errors.New("broker down")
+	w.SetFailPublish(nil)
+	if err := <-done; err != nil {
+		t.Fatalf("stalled batch must still complete: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; !errors.Is(err, ErrWALProduce) {
+			t.Fatalf("waiter %d: expected ErrWALProduce, got %v", i, err)
+		}
+	}
+	if fr.count() != 1 || r.eng.LastSeq() != 1 || len(w.Records[0]) != 1 {
+		t.Fatalf("fatal=%d last=%d wal=%d", fr.count(), r.eng.LastSeq(), len(w.Records[0]))
+	}
 }
 
 func TestRunnerShutdownDuringProduceRetryIsNotFatal(t *testing.T) {
@@ -259,8 +322,11 @@ func TestRunnerRetriesEventPublishUntilItSucceeds(t *testing.T) {
 	}
 }
 
+// After cancel the runner keeps retrying for shutdownGrace, then fails the
+// waiters with ErrShuttingDown.
 func TestRunnerShutdownDuringPublishRetryFailsPending(t *testing.T) {
 	r, w, fr, cancel := newRunnerT(t)
+	r.shutdownGrace = 5 * time.Millisecond
 	ctx := context.Background()
 	w.SetFailPublish(errors.New("events down"))
 	done := make(chan error, 1)
@@ -269,13 +335,48 @@ func TestRunnerShutdownDuringPublishRetryFailsPending(t *testing.T) {
 		done <- err
 	}()
 	waitFor(t, "a publish failure", func() bool { return testutil.ToFloat64(r.m.PublishFailures) >= 1 })
+	before := w.PublishCount()
 	cancel()
 	if err := <-done; !errors.Is(err, ErrShuttingDown) {
 		t.Fatalf("expected ErrShuttingDown, got %v", err)
 	}
 	<-r.Done()
-	if fr.count() != 0 || len(w.Records[0]) != 1 || r.eng.LastSeq() != 1 {
-		t.Fatalf("fatal=%d wal=%d last=%d", fr.count(), len(w.Records[0]), r.eng.LastSeq())
+	if w.PublishCount() <= before {
+		t.Fatal("no publish attempt was made during the shutdown grace")
+	}
+	if fr.count() != 0 || len(w.Records[0]) != 1 || r.eng.LastSeq() != 1 || w.EventCount() != 0 {
+		t.Fatalf("fatal=%d wal=%d last=%d events=%d", fr.count(), len(w.Records[0]), r.eng.LastSeq(), w.EventCount())
+	}
+}
+
+// A publish that succeeds within the grace completes the waiters normally.
+func TestRunnerPublishSucceedsWithinShutdownGrace(t *testing.T) {
+	r, w, fr, cancel := newRunnerT(t)
+	r.shutdownGrace = 5 * time.Second
+	ctx := context.Background()
+	w.SetFailPublish(errors.New("events down"))
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := r.Submit(ctx, &enginev1.Command{Body: createCmd(0).Body})
+		done <- outcome{res: res, err: err}
+	}()
+	waitFor(t, "a publish failure", func() bool { return testutil.ToFloat64(r.m.PublishFailures) >= 1 })
+	cancel()
+	after := testutil.ToFloat64(r.m.PublishFailures)
+	waitFor(t, "retries to continue after cancel", func() bool { return testutil.ToFloat64(r.m.PublishFailures) >= after+2 })
+	select {
+	case o := <-done:
+		t.Fatalf("completed during the grace without publishing: %+v", o)
+	default:
+	}
+	w.SetFailPublish(nil)
+	o := <-done
+	if o.err != nil || o.res.Seq != 1 || len(o.res.Events) != 1 {
+		t.Fatalf("expected a normal result, got %+v", o)
+	}
+	<-r.Done()
+	if w.EventCount() != 1 || fr.count() != 0 {
+		t.Fatalf("events=%d fatal=%d", w.EventCount(), fr.count())
 	}
 }
 

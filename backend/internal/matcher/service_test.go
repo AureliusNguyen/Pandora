@@ -7,9 +7,11 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	commonv1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/common/v1"
 	matcherv1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/matcher/v1"
@@ -57,6 +59,12 @@ func TestServiceStartCreatesDemoMarketOnceAndBecomesReady(t *testing.T) {
 	}
 	if len(w.Records[0]) != 1 || w.EventCount() != 1 || svc2.Runner().eng.LastSeq() != 1 {
 		t.Fatalf("second start: wal=%d events=%d last=%d", len(w.Records[0]), w.EventCount(), svc2.Runner().eng.LastSeq())
+	}
+	if got := testutil.ToFloat64(svc2.Runner().m.LastSeq.WithLabelValues("0")); got != 1 {
+		t.Fatalf("last_seq after replay = %v, want 1", got)
+	}
+	if svc2.Runner().shutdownGrace != closeFlushTimeout {
+		t.Fatalf("default shutdown grace %v, want %v", svc2.Runner().shutdownGrace, closeFlushTimeout)
 	}
 	svc2.Stop()
 }
@@ -110,5 +118,12 @@ func TestServiceDefaultsNewIDToULID(t *testing.T) {
 	resp, err := svc.SubmitOrder(context.Background(), connect.NewRequest(&matcherv1.SubmitOrderRequest{Order: order("u_alice", commonv1.Side_SIDE_BUY, 40, 1)}))
 	if err != nil || !ids.Valid(resp.Msg.OrderId) {
 		t.Fatalf("order_id %q err=%v", resp.Msg.GetOrderId(), err)
+	}
+}
+
+func TestServiceShutdownGraceOption(t *testing.T) {
+	svc := NewService(Options{WAL: NewFakeWAL(), Metrics: NewMetrics(prometheus.NewRegistry()), Log: slog.Default(), ShutdownGrace: time.Second})
+	if svc.Runner().shutdownGrace != time.Second {
+		t.Fatalf("shutdown grace %v, want 1s", svc.Runner().shutdownGrace)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	enginev1 "github.com/aureliusnguyen/pandora/backend/gen/go/pandora/engine/v1"
 	"github.com/aureliusnguyen/pandora/backend/internal/engine"
@@ -29,6 +30,9 @@ type Options struct {
 	DemoMarket bool
 	Now        func() int64        // optional
 	Fatal      func(string, error) // optional (tests)
+	// ShutdownGrace bounds how long an events publish keeps retrying after
+	// Stop; 0 means closeFlushTimeout (10 s). cmd/matcher may set it.
+	ShutdownGrace time.Duration
 }
 
 // Service is the MatcherService implementation over one partition runner
@@ -52,6 +56,9 @@ func NewService(o Options) *Service {
 	if o.Fatal != nil {
 		r.Fatal = o.Fatal
 	}
+	if o.ShutdownGrace > 0 {
+		r.shutdownGrace = o.ShutdownGrace
+	}
 	return &Service{o: o, runner: r}
 }
 
@@ -65,6 +72,7 @@ func (s *Service) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("replay partition %d: %w", s.o.Partition, err)
 	}
+	s.runner.observeLastSeq()
 	s.o.Log.Info("replay complete", "partition", s.o.Partition, "applied", n, "last_seq", s.runner.eng.LastSeq())
 	rctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.cancel = cancel

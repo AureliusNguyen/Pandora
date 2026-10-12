@@ -27,6 +27,8 @@ var (
 	// ErrWALProduce wraps a WAL batch that still failed after walRetries
 	// retries. The runner then calls Fatal: the broker may hold part of the
 	// batch, so the only safe recovery is a restart that replays the journal.
+	// Worst case time to Fatal against a dead broker: six attempts bounded
+	// by KafkaWAL's 10 s RecordDeliveryTimeout plus 5 s of backoff, ~65 s.
 	ErrWALProduce = errors.New("matcher: wal produce failed")
 	// ErrMarshal wraps a command that could not be marshaled; nothing was
 	// journaled. Handlers map it to CodeInternal.
@@ -79,18 +81,27 @@ type request struct {
 // Runner owns one partition's engine. One goroutine sequences, journals,
 // applies and publishes; everything else talks to it through Submit.
 type Runner struct {
-	partition      uint32
-	partLabel      string
-	eng            *engine.Engine
-	wal            WAL
-	m              *Metrics
-	log            *slog.Logger
-	tracer         trace.Tracer
+	partition uint32
+	partLabel string
+	eng       *engine.Engine
+	wal       WAL
+	m         *Metrics
+	log       *slog.Logger
+	tracer    trace.Tracer
+	// reqs is the Submit queue (4*MaxBatch deep). Backpressure: when the
+	// loop is blocked (a WAL retry or a publish retry during a broker
+	// outage) the channel fills and Submit blocks on the send until the
+	// caller's context ends, so the caller sees Canceled/DeadlineExceeded
+	// (the gateway maps those to a retryable status) and nothing is
+	// journaled for it.
 	reqs           chan *request
 	stopped        chan struct{}
 	mu             sync.Mutex // guards eng for Book/HasMarket readers
 	walBackoff     backoff
 	publishBackoff backoff
+	// shutdownGrace bounds how long a publish keeps retrying after the
+	// runner ctx is canceled (Options.ShutdownGrace, default closeFlushTimeout).
+	shutdownGrace time.Duration
 
 	// Now stamps engine_time_unix_nanos (unix nanos). Replaceable in tests.
 	Now func() int64
@@ -112,6 +123,7 @@ func NewRunner(partition uint32, eng *engine.Engine, wal WAL, m *Metrics, log *s
 		stopped:        make(chan struct{}),
 		walBackoff:     walBackoffDefault,
 		publishBackoff: publishBackoffDefault,
+		shutdownGrace:  closeFlushTimeout,
 		Now:            func() int64 { return time.Now().UnixNano() },
 	}
 	r.Fatal = func(msg string, err error) {
@@ -272,7 +284,7 @@ func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) {
 		events = append(events, evs...)
 	}
 	r.m.Apply.Observe(time.Since(t0).Seconds())
-	r.m.LastSeq.WithLabelValues(r.partLabel).Set(float64(r.eng.LastSeq()))
+	r.observeLastSeq()
 	span.End()
 
 	if err := r.publishWithRetry(ctx, events); err != nil {
@@ -285,6 +297,11 @@ func (r *Runner) flush(ctx context.Context, batch []*request, values [][]byte) {
 	for i, q := range batch {
 		q.done <- outcome{res: results[i]}
 	}
+}
+
+// observeLastSeq sets the last_seq{partition} gauge from the engine.
+func (r *Runner) observeLastSeq() {
+	r.m.LastSeq.WithLabelValues(r.partLabel).Set(float64(r.eng.LastSeq()))
 }
 
 // sleep waits d or until ctx is done; it reports whether the wait completed.
@@ -302,7 +319,10 @@ func sleep(ctx context.Context, d time.Duration) bool {
 // appendWithRetry journals values, retrying walRetries times. The produce
 // itself is never canceled (an interrupted batch is ambiguous); when ctx
 // ends between attempts the batch fails with ErrShuttingDown, which is a
-// clean exit, not a WAL failure.
+// clean exit, not a WAL failure. Against a dead broker each attempt takes
+// up to KafkaWAL's 10 s RecordDeliveryTimeout, so the caller sees the
+// error (and Fatal runs) after about 6*10 s + 5 s of backoff = ~65 s;
+// against a reachable broker that rejects the batch it is ~5 s.
 func (r *Runner) appendWithRetry(ctx context.Context, n int, values [][]byte) error {
 	pctx, span := r.tracer.Start(ctx, "matcher.wal.produce", trace.WithAttributes(attribute.Int("batch.size", n)))
 	defer span.End()
@@ -330,7 +350,8 @@ func (r *Runner) appendWithRetry(ctx context.Context, n int, values [][]byte) er
 
 // publishWithRetry publishes events, retrying forever with exponential
 // backoff (ruling X3: events are derived and at-least-once, never
-// dropped). It returns ErrShuttingDown only when ctx ends first.
+// dropped). When ctx ends it keeps retrying for shutdownGrace, then gives
+// up with ErrShuttingDown and logs the unpublished seq range.
 func (r *Runner) publishWithRetry(ctx context.Context, events []*enginev1.Event) error {
 	if len(events) == 0 {
 		return nil
@@ -352,7 +373,8 @@ func (r *Runner) publishWithRetry(ctx context.Context, events []*enginev1.Event)
 	defer span.End()
 	pctx = context.WithoutCancel(pctx)
 	first, last := events[0].Seq, events[len(events)-1].Seq
-	for attempt := 0; ; attempt++ {
+	attempt := 0
+	for ; ; attempt++ {
 		err := r.wal.Publish(pctx, r.partition, keys, values)
 		if err == nil {
 			return nil
@@ -361,7 +383,24 @@ func (r *Runner) publishWithRetry(ctx context.Context, events []*enginev1.Event)
 		d := r.publishBackoff.next(attempt)
 		r.log.Error("publish events failed; retrying", "err", err, "attempt", attempt+1, "retry_in", d, "first_seq", first, "last_seq", last)
 		if !sleep(ctx, d) {
-			r.log.Error("shutting down with unpublished events", "first_seq", first, "last_seq", last)
+			break
+		}
+	}
+	// Shutdown began while the batch is unpublished: keep trying for the
+	// grace period so a rollout does not lose the last events.
+	gctx, cancel := context.WithTimeout(pctx, r.shutdownGrace)
+	defer cancel()
+	r.log.Warn("shutdown with unpublished events; retrying for the grace period", "grace", r.shutdownGrace, "first_seq", first, "last_seq", last)
+	for ; ; attempt++ {
+		err := r.wal.Publish(gctx, r.partition, keys, values)
+		if err == nil {
+			return nil
+		}
+		r.m.PublishFailures.Inc()
+		d := r.publishBackoff.next(attempt)
+		r.log.Error("publish events failed; retrying", "err", err, "attempt", attempt+1, "retry_in", d, "first_seq", first, "last_seq", last)
+		if gctx.Err() != nil || !sleep(gctx, d) {
+			r.log.Error("shutdown grace expired with unpublished events; callers get ErrShuttingDown", "first_seq", first, "last_seq", last, "events", len(values))
 			return ErrShuttingDown
 		}
 	}
