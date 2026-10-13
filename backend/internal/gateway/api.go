@@ -60,10 +60,9 @@ func (o OrderRequest) Proto(userID string) *enginev1.SubmitOrder {
 	}
 }
 
-// LegJSON is one participant's side of a fill.
+// LegJSON is one participant's side of a fill. OrderID and UserID are
+// omitted from the response to avoid leaking counterparty identity.
 type LegJSON struct {
-	OrderID string `json:"order_id"`
-	UserID  string `json:"user_id"`
 	Outcome uint32 `json:"outcome"`
 	Side    string `json:"side"`
 	Price   uint32 `json:"price"`
@@ -136,7 +135,7 @@ func toOrderResponse(m *matcherv1.SubmitOrderResponse) OrderResponse {
 	for _, f := range m.GetFills() {
 		fj := FillJSON{FillID: f.GetFillId(), Kind: strings.TrimPrefix(f.GetKind().String(), "FILL_KIND_"), Qty: f.GetQty(), Legs: []LegJSON{}}
 		for _, l := range f.GetLegs() {
-			fj.Legs = append(fj.Legs, LegJSON{l.GetOrderId(), l.GetUserId(), l.GetOutcome(), sideName(l.GetSide()), l.GetPrice(), l.GetIsTaker()})
+			fj.Legs = append(fj.Legs, LegJSON{l.GetOutcome(), sideName(l.GetSide()), l.GetPrice(), l.GetIsTaker()})
 		}
 		out.Fills = append(out.Fills, fj)
 	}

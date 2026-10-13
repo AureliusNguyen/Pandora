@@ -144,7 +144,7 @@ func (h *Hub) Subscribe(c *Client, markets []string) {
 	for _, m := range markets {
 		v := h.views[m]
 		if v == nil {
-			h.replyLocked(c, "error", SimpleMsg{Type: "error", Message: "unknown market " + m})
+			h.replyLocked(c, "error", SimpleMsg{Type: "error", Message: "unknown market"})
 			continue
 		}
 		if h.subs[m] == nil {

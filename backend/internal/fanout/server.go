@@ -120,7 +120,7 @@ func (s *WSServer) serveWS(w http.ResponseWriter, r *http.Request) {
 		case "ping":
 			s.hub.Reply(c, "pong", SimpleMsg{Type: "pong"})
 		default:
-			s.hub.Reply(c, "error", SimpleMsg{Type: "error", Message: "unknown message type " + m.Type})
+			s.hub.Reply(c, "error", SimpleMsg{Type: "error", Message: "unknown message type"})
 		}
 	}
 	cancel()
