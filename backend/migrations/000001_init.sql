@@ -2,7 +2,7 @@
 CREATE TABLE users (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE accounts (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('user_cash','market_escrow','faucet','dispute')),
   owner_id TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (kind, owner_id));
-CREATE TABLE wallets (user_id TEXT PRIMARY KEY REFERENCES users(id), balance_cents BIGINT NOT NULL DEFAULT 0 CHECK (balance_cents >= 0), version BIGINT NOT NULL DEFAULT 0);
+CREATE TABLE wallets (user_id TEXT PRIMARY KEY REFERENCES users(id), balance_cents BIGINT NOT NULL DEFAULT 0, version BIGINT NOT NULL DEFAULT 0);
 CREATE TABLE ledger_txns (id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL, ref TEXT NOT NULL, partition INT NOT NULL, seq BIGINT NOT NULL, idx INT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (partition, seq, idx));
 CREATE TABLE ledger_entries (id BIGSERIAL PRIMARY KEY, txn_id BIGINT NOT NULL REFERENCES ledger_txns(id), account_id TEXT NOT NULL REFERENCES accounts(id), amount_cents BIGINT NOT NULL);
